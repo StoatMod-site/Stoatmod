@@ -1,0 +1,21 @@
+[Unit]
+Description=Stoatmod service status and downtime monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stoatmod
+Group=stoatmod
+WorkingDirectory=/opt/stoatmod
+ExecStart=/opt/stoatmod/.venv/bin/python -m api.status_monitor
+Environment=STATUS_HISTORY_PATH=/opt/stoatmod/status-history.sqlite3
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/stoatmod
+
+[Install]
+WantedBy=multi-user.target

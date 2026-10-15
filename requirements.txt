@@ -1,0 +1,4 @@
+aiohttp>=3.10,<4
+stoat.py>=1.2.1,<2
+Pillow>=11,<13
+tldextract>=5.3.2,<6

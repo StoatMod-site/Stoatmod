@@ -1,0 +1,22 @@
+[Unit]
+Description=Stoatmod moderation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stoatmod
+Group=stoatmod
+WorkingDirectory=/opt/stoatmod
+EnvironmentFile=/opt/stoatmod/.env
+ExecStart=/opt/stoatmod/.venv/bin/python -u /opt/stoatmod/bot.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/stoatmod
+
+[Install]
+WantedBy=multi-user.target
