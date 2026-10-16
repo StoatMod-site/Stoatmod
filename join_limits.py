@@ -203,7 +203,7 @@ class JoinLimitFlow:
         config = self.store.settings(server_id)
         if config["attachments"] and getattr(message, "attachments", None):
             return "attachment"
-        if config["links"] and self.bot._contains_link(message.content or ""):
+        if config["links"] and self.bot._contains_filterable_link(message.content or "", server_id=server_id):
             return "link"
         return None
 

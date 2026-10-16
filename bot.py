@@ -223,6 +223,8 @@ PUBLIC_SUFFIX_EXTRACTOR = tldextract.TLDExtract(
     suffix_list_urls=(),
 )
 AUTOMATIC_LINK_DELETION_ALLOWED_HOSTS = frozenset({"gifbox.me"})
+# Links to a channel or message in the same server are internal, not external links.
+STOAT_APP_HOSTS = frozenset({"stoat.chat", "www.stoat.chat", "app.stoat.chat"})
 # "~kick <@a> <@b> ID reason": user mentions or Stoat IDs listed before the reason, optionally separated by commas.
 BULK_TARGET_RE = re.compile(r"[\s,]*(?:<@!?([0-9A-HJKMNP-TV-Z]{26})>|([0-9A-HJKMNP-TV-Z]{26})(?![0-9A-Za-z]))")
 MAX_BULK_TARGETS = 25
@@ -2206,6 +2208,7 @@ class ModerationBot(stoat.Client):
                     and self._contains_filterable_link(
                         content,
                         allow_gifs=self._server_allows_gifs(server_id),
+                        server_id=server_id,
                     )
                 )
                 or (trigger == "has_attachment" and bool(message.attachments))
@@ -3826,14 +3829,27 @@ class ModerationBot(stoat.Client):
         getter = getattr(self.database, "get_allow_gifs", None)
         return bool(getter(server_id)) if callable(getter) else False
 
+    @staticmethod
+    def _is_same_server_stoat_link(link: str, server_id: str | None) -> bool:
+        """A Stoat link to a channel or message in this server (shown as a channel chip), not an external link."""
+        if not server_id:
+            return False
+        candidate = link.strip().rstrip(".,;:!?)]}")
+        parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+        if (parsed.hostname or "").casefold().rstrip(".") not in STOAT_APP_HOSTS:
+            return False
+        segments = [segment for segment in parsed.path.split("/") if segment]
+        if segments[:1] == ["app"]:
+            segments = segments[1:]
+        return len(segments) >= 2 and segments[0] == "server" and segments[1] == server_id
+
     @classmethod
     def _contains_filterable_link(
-        cls, content: str, *, allow_gifs: bool = False
+        cls, content: str, *, allow_gifs: bool = False, server_id: str | None = None
     ) -> bool:
-        if not allow_gifs:
-            return cls._contains_link(content)
         return any(
-            not cls._link_is_allowed_for_automatic_deletion(match.group(0))
+            not (allow_gifs and cls._link_is_allowed_for_automatic_deletion(match.group(0)))
+            and not cls._is_same_server_stoat_link(match.group(0), server_id)
             for match in LINK_PATTERN.finditer(content)
             if cls._link_candidate_is_valid(match.group(0))
         )
@@ -3847,6 +3863,7 @@ class ModerationBot(stoat.Client):
         if not self._contains_filterable_link(
             message.content,
             allow_gifs=self._server_allows_gifs(server_id),
+            server_id=server_id,
         ):
             return False
         if not await self.require_action_permissions(server, "manage_messages"):
