@@ -223,6 +223,9 @@ PUBLIC_SUFFIX_EXTRACTOR = tldextract.TLDExtract(
     suffix_list_urls=(),
 )
 AUTOMATIC_LINK_DELETION_ALLOWED_HOSTS = frozenset({"gifbox.me"})
+# "~kick <@a> <@b> ID reason": user mentions or Stoat IDs listed before the reason, optionally separated by commas.
+BULK_TARGET_RE = re.compile(r"[\s,]*(?:<@!?([0-9A-HJKMNP-TV-Z]{26})>|([0-9A-HJKMNP-TV-Z]{26})(?![0-9A-Za-z]))")
+MAX_BULK_TARGETS = 25
 FLOOD_PATTERN = re.compile(r"(.)\1{7,}")
 EVERYONE_MENTION_PATTERN = re.compile(r"(?<![\w@])@(?:everyone|online)\b", re.IGNORECASE)
 # Stoat sets these message flags only when the author may mention everyone/online.
@@ -2415,8 +2418,8 @@ class ModerationBot(stoat.Client):
                 logger.exception("status_rotation_update_failed")
             await asyncio.sleep(STATUS_ROTATION_SECONDS)
 
-    def dispatch_scan(self, message: stoat.Message) -> None:
-        task = asyncio.create_task(self.scan_message(message))
+    def dispatch_scan(self, message: stoat.Message, **options: object) -> None:
+        task = asyncio.create_task(self.scan_message(message, **options))
         self._tasks.add(task)
         task.add_done_callback(self._scan_task_stopped)
 
@@ -4584,6 +4587,21 @@ class ModerationBot(stoat.Client):
                 user=member,
             )
 
+    @staticmethod
+    def _split_bulk_targets(text: str) -> tuple[list[str], str]:
+        """Split "<@a> <@b>, ID reason words" into (["a", "b", "ID"], "reason words")."""
+        targets: list[str] = []
+        position = 0
+        while True:
+            match = BULK_TARGET_RE.match(text, position)
+            if match is None:
+                break
+            user_id = match.group(1) or match.group(2)
+            if user_id not in targets:
+                targets.append(user_id)
+            position = match.end()
+        return targets, text[position:].strip(" ,\t\r\n")
+
     async def handle_kick_ban_command(
         self,
         message: stoat.Message,
@@ -4592,6 +4610,10 @@ class ModerationBot(stoat.Client):
         command: str,
         parts: list[str],
     ) -> None:
+        targets, reason = self._split_bulk_targets(" ".join(parts[1:]))
+        if len(targets) > 1:
+            await self._handle_bulk_kick_ban(message, server, server_id, command, targets, reason)
+            return
         reason = await self._require_command_reason(message, command, parts)
         if reason is None:
             return
@@ -4637,6 +4659,84 @@ class ModerationBot(stoat.Client):
             f"**User:** `{await self._resolve_user_tag(user_id)}`\n**Reason:** {reason}",
             color="#ED4245",
         )
+
+    async def _handle_bulk_kick_ban(
+        self,
+        message: stoat.Message,
+        server: stoat.Server,
+        server_id: str,
+        command: str,
+        targets: list[str],
+        reason: str,
+    ) -> None:
+        """Kick or ban several members listed before one shared reason."""
+        action = command[1:]
+        if not reason.strip("`\"' \t\r\n"):
+            await self.send_command_response(
+                message, "Reason required",
+                f"A reason is required.\n\nUsage: `{SERVER_COMMAND_USAGES[command]}`\n"
+                f"List several members before the reason to {action} them all at once.",
+                color="#F59E0B",
+            )
+            return
+        if len(targets) > MAX_BULK_TARGETS:
+            await self.send_command_response(
+                message, "Too many members",
+                f"You can {action} up to {MAX_BULK_TARGETS} members in one command. "
+                f"You listed {len(targets)}.",
+                color="#F59E0B",
+            )
+            return
+        permission = "kick_members" if command == "~kick" else "ban_members"
+        if not await self.require_action_permissions(server, permission):
+            return
+        bot_id = getattr(getattr(self, "_state", None), "my_id", None)
+        done: list[str] = []
+        failed: list[tuple[str, str]] = []
+        for user_id in targets:
+            if user_id == message.author_id:
+                failed.append((user_id, f"you can't {action} yourself"))
+                continue
+            if bot_id and user_id == bot_id:
+                failed.append((user_id, f"Stoatmod can't {action} itself"))
+                continue
+            try:
+                if command == "~kick":
+                    member = server.get_member(user_id) or await server.fetch_member(user_id)
+                    await self._kick_member_with_reason(
+                        member, server_id, user_id, reason, actor_id=message.author_id,
+                    )
+                else:
+                    self._pending_ban_attribution[(server_id, user_id)] = (message.author_id, reason)
+                    await server.ban(user_id, reason=reason[:1024])
+            except Exception:
+                if command == "~kick":
+                    self._pending_kick_attribution.pop((server_id, user_id), None)
+                else:
+                    self._pending_ban_attribution.pop((server_id, user_id), None)
+                logger.exception(
+                    "manual_member_action_failed server_id=%s user_id=%s action=%s",
+                    server_id, user_id, action,
+                )
+                failed.append((user_id, "not in the server, or above Stoatmod's role"))
+                continue
+            done.append(user_id)
+        past = "kicked" if command == "~kick" else "banned"
+        lines: list[str] = []
+        if done:
+            lines.append(f"**{past.title()} ({len(done)}):**")
+            lines.extend([f"• `{await self._resolve_user_tag(user_id)}`" for user_id in done])
+        if failed:
+            lines.append(f"\n**Not {past} ({len(failed)}):**")
+            lines.extend([f"• `{await self._resolve_user_tag(user_id)}`: {why}" for user_id, why in failed])
+        lines.append(f"\n**Reason:** {reason}")
+        if done and not failed:
+            title, color = f"{len(done)} members {past}", "#ED4245"
+        elif done:
+            title, color = f"{len(done)} of {len(targets)} members {past}", "#F59E0B"
+        else:
+            title, color = f"{action.title()} failed", "#ED4245"
+        await self.send_command_response(message, title, "\n".join(lines), color=color)
 
     async def handle_unban_command(
         self, message: stoat.Message, server: stoat.Server, server_id: str, parts: list[str]
@@ -9407,6 +9507,37 @@ class ModerationBot(stoat.Client):
             return
         self.dispatch_scan(message)
 
+    async def handle_message_append(self, event: stoat.MessageAppendEvent) -> None:
+        """Stoat adds link previews (images, GIF links, website pictures) after a message is sent; scan just those."""
+        embeds = event.data.embeds
+        if embeds is stoat.UNDEFINED or not embeds:
+            return
+        message = event.message
+        if message is None:
+            channel = self.get_channel(event.data.channel_id)
+            fetch = getattr(channel, "fetch_message", None)
+            if fetch is None:
+                return
+            try:
+                message = await fetch(event.data.id)
+            except Exception:
+                logger.warning(
+                    "appended_message_fetch_failed channel_id=%s message_id=%s",
+                    event.data.channel_id,
+                    event.data.id,
+                )
+                return
+        if not self.message_is_in_scope(message):
+            return
+        if self._user_is_bot(message.get_author_as_user()):
+            return
+        _server, server_id = message.get_server()
+        if not server_id or not self.database.get_image_scanning(server_id, message.channel_id):
+            return
+        if not self._embed_images(list(embeds), prefix="append"):
+            return
+        self.dispatch_scan(message, appended_embeds=list(embeds))
+
     async def handle_message_delete_bulk(self, event: stoat.MessageDeleteBulkEvent) -> None:
         self._bot_deleted_ids.difference_update(event.message_ids)
 
@@ -9777,34 +9908,51 @@ class ModerationBot(stoat.Client):
             color="#ED4245" if event.reason is not stoat.MemberRemovalIntention.leave else "#747F8D",
         )
 
-    async def scan_message(self, message: stoat.Message) -> None:
+    def _embed_images(self, embeds: list, prefix: str = "embed") -> list[tuple[str, str]]:
+        images: list[tuple[str, str]] = []
+        for index, embed in enumerate(embeds):
+            if isinstance(embed, stoat.ImageEmbed):
+                images.append((f"{prefix}:{index}", embed.url))
+            elif isinstance(embed, stoat.WebsiteEmbed):
+                # A pasted link's preview picture is shown in the channel just like an upload.
+                preview = getattr(embed, "image", None)
+                preview_url = getattr(preview, "url", None)
+                if isinstance(preview_url, str) and preview_url.startswith("https://"):
+                    images.append((f"{prefix}:{index}:preview", preview_url))
+            elif isinstance(embed, stoat.TextEmbed):
+                media = embed.media
+                if (
+                    media is not None
+                    and str(media.content_type or "").lower().startswith("image/")
+                    and 0 < media.size <= self.moderation_settings.max_image_bytes
+                    and not media.deleted
+                ):
+                    images.append((media.id, media.url()))
+        return images
+
+    async def scan_message(
+        self, message: stoat.Message, *, appended_embeds: list | None = None
+    ) -> None:
+        """Scan a message. With appended_embeds, only those newly added link previews are scanned."""
         if await self._message_author_is_moderator(message):
             return
         server, server_id = message.get_server()
         if server is None or not server_id:
             return
-        text_content = message.content.strip()
+        text_content = message.content.strip() if appended_embeds is None else ""
         images: list[tuple[str, str]] = []
         if self.database.get_image_scanning(server_id, message.channel_id):
-            images = [
-                (asset.id, asset.url())
-                for asset in message.attachments
-                if str(asset.content_type or "").lower().startswith("image/")
-                and 0 < asset.size <= self.moderation_settings.max_image_bytes
-                and not asset.deleted
-            ]
-            for index, embed in enumerate(message.embeds):
-                if isinstance(embed, stoat.ImageEmbed):
-                    images.append((f"embed:{index}", embed.url))
-                elif isinstance(embed, stoat.TextEmbed):
-                    media = embed.media
-                    if (
-                        media is not None
-                        and str(media.content_type or "").lower().startswith("image/")
-                        and 0 < media.size <= self.moderation_settings.max_image_bytes
-                        and not media.deleted
-                    ):
-                        images.append((media.id, media.url()))
+            if appended_embeds is not None:
+                images = self._embed_images(appended_embeds, prefix="append")
+            else:
+                images = [
+                    (asset.id, asset.url())
+                    for asset in message.attachments
+                    if str(asset.content_type or "").lower().startswith("image/")
+                    and 0 < asset.size <= self.moderation_settings.max_image_bytes
+                    and not asset.deleted
+                ]
+                images.extend(self._embed_images(message.embeds))
         if not text_content and not images:
             return
 
@@ -10363,6 +10511,10 @@ def main() -> None:
                 len(message.embeds),
             )
         client.dispatch_scan(message)
+
+    @client.on(stoat.MessageAppendEvent)
+    async def on_message_append(event: stoat.MessageAppendEvent, /) -> None:
+        await client.handle_message_append(event)
 
     @client.on(stoat.MessageDeleteEvent)
     async def on_message_delete(event: stoat.MessageDeleteEvent, /) -> None:

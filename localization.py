@@ -100,6 +100,7 @@ HELP_DESCRIPTIONS = {
 Use a mention or user ID. Mute duration goes before or after the reason; default: 1 hour.
 Reasons are required for moderation actions. `~remove CASE_ID` needs no reason.
 `~kick USER_ID REASON` / `~ban USER_ID REASON`
+List several members before the reason to kick or ban up to 25 at once.
 
 **🔧 Configuration**
 `~setup` · `~policy` · `~dashboard` · `~bypass USER_ID REASON`
@@ -127,6 +128,7 @@ Reasons are required for moderation actions. `~remove CASE_ID` needs no reason.
 `~mute USER_ID [DURÉE] RAISON` / `~unmute USER_ID RAISON`
 `~unban USER_ID RAISON`
 `~kick USER_ID RAISON` / `~ban USER_ID RAISON`
+Mentionnez plusieurs membres avant la raison pour en expulser ou bannir jusqu’à 25 d’un coup.
 
 **🔧 Configuration**
 `~setup` · `~policy` · `~dashboard` · `~bypass USER_ID REASON`
@@ -154,6 +156,7 @@ Reasons are required for moderation actions. `~remove CASE_ID` needs no reason.
 `~mute USER_ID [DURAÇÃO] MOTIVO` / `~unmute USER_ID MOTIVO`
 `~unban USER_ID MOTIVO`
 `~kick USER_ID MOTIVO` / `~ban USER_ID MOTIVO`
+Mencione vários membros antes do motivo para expulsar ou banir até 25 de uma vez.
 
 **🔧 Configuração**
 `~setup` · `~policy` · `~dashboard` · `~bypass USER_ID REASON`
@@ -181,6 +184,7 @@ Reasons are required for moderation actions. `~remove CASE_ID` needs no reason.
 `~mute USER_ID [DURACIÓN] MOTIVO` / `~unmute USER_ID MOTIVO`
 `~unban USER_ID MOTIVO`
 `~kick USER_ID MOTIVO` / `~ban USER_ID MOTIVO`
+Menciona a varios miembros antes del motivo para expulsar o banear hasta 25 a la vez.
 
 **🔧 Configuración**
 `~setup` · `~policy` · `~dashboard` · `~bypass USER_ID REASON`
