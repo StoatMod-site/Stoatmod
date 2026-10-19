@@ -1984,10 +1984,13 @@ class ModerationDatabaseTests(unittest.TestCase):
         )
 
     def test_image_scanning_has_server_default_and_channel_overrides(self) -> None:
-        self.assertFalse(self.database.get_image_scanning("server-a"))
-        self.assertFalse(
+        # On by default since 2026-10-19.
+        self.assertTrue(self.database.get_image_scanning("server-a"))
+        self.assertTrue(
             self.database.get_image_scanning("server-a", "channel-a")
         )
+        self.database.set_image_scanning("server-a", False)
+        self.assertFalse(self.database.get_image_scanning("server-a", "channel-a"))
 
         self.database.set_image_scanning("server-a", True)
         self.assertTrue(
@@ -2023,29 +2026,33 @@ class ModerationDatabaseTests(unittest.TestCase):
             self.database.get_image_scanning("server-a", "channel-b")
         )
 
-    def test_experimental_image_migration_disables_existing_servers_and_overrides(self) -> None:
-        self.database.set_image_scanning("server-a", True)
-        self.database.set_channel_image_scanning(
-            "server-a", "channel-a", True, "moderator-a"
-        )
-        self.database.connection.execute(
-            "DELETE FROM app_metadata WHERE key='image_scanning_experimental_opt_in_v1'"
-        )
-        self.database.connection.commit()
+    def test_image_scanning_default_on_migration_keeps_latest_server_wide_denials(self) -> None:
+        connection = self.database.connection
+        for server in ("untouched", "denied", "denied-then-enabled", "channel-only", "dashboard-denied"):
+            connection.execute(
+                "INSERT INTO server_settings(server_id, image_scanning_enabled, image_scanning_on) VALUES (?, 0, 0)",
+                (server,),
+            )
+        self.database.add_event(server_id="denied", event_type="image_scanning_disabled", details={"target_channel_id": None})
+        self.database.add_event(server_id="denied-then-enabled", event_type="image_scanning_disabled", details={"target_channel_id": None})
+        self.database.add_event(server_id="denied-then-enabled", event_type="image_scanning_enabled", details={"target_channel_id": None})
+        self.database.add_event(server_id="channel-only", event_type="image_scanning_disabled", details={"target_channel_id": "channel-a"})
+        self.database.add_event(server_id="dashboard-denied", event_type="dashboard_settings_updated",
+                                details={"changed": {"image_scanning": False}})
+        self.database.set_channel_image_scanning("channel-only", "channel-a", False, "moderator-a")
+        connection.execute("DELETE FROM app_metadata WHERE key='image_scanning_default_on_v1'")
+        connection.commit()
 
         database_path = self.database.path
         self.database.close()
         self.database = ModerationDatabase(database_path)
 
-        self.assertFalse(self.database.get_image_scanning("server-a"))
-        self.assertFalse(
-            self.database.get_image_scanning("server-a", "channel-a")
-        )
-        self.assertIsNone(
-            self.database.get_channel_image_scanning_override(
-                "server-a", "channel-a"
-            )
-        )
+        self.assertTrue(self.database.get_image_scanning("untouched"))
+        self.assertFalse(self.database.get_image_scanning("denied"))
+        self.assertTrue(self.database.get_image_scanning("denied-then-enabled"))
+        self.assertTrue(self.database.get_image_scanning("channel-only"))
+        self.assertFalse(self.database.get_image_scanning("channel-only", "channel-a"))
+        self.assertFalse(self.database.get_image_scanning("dashboard-denied"))
 
     def test_moderator_exemption_is_enabled_by_default_and_persistent(self) -> None:
         self.assertTrue(self.database.get_moderator_exemption("server-a"))

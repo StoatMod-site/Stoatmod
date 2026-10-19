@@ -1254,6 +1254,8 @@ class ModerationDatabase:
             ("gifbox_links_allowed", 1),
             ("spam_detection_enabled", 1),
             ("image_scanning_enabled", 0),
+            # Image scanning is on by default (2026-10-19); servers that turned it off keep their choice.
+            ("image_scanning_on", 1),
             ("ai_thinking_enabled", 0),
             ("moderator_exemption_enabled", 1),
             ("alt_detection_enabled", 0),
@@ -1615,6 +1617,34 @@ class ModerationDatabase:
                 )
             self.connection.execute(
                 "INSERT INTO app_metadata(key, value) VALUES ('link_policy_gifbox_default_v2', '1')"
+            )
+        if self.connection.execute(
+            "SELECT 1 FROM app_metadata WHERE key='image_scanning_default_on_v1'"
+        ).fetchone() is None:
+            # The new column defaults to on. A server stays off only if its latest
+            # server-wide choice (command or dashboard) was to turn scanning off.
+            latest: dict[str, bool] = {}
+            for row in self.connection.execute(
+                """
+                SELECT server_id, event_type, details_json FROM moderation_events
+                WHERE event_type IN ('image_scanning_enabled', 'image_scanning_disabled')
+                   OR (event_type='dashboard_settings_updated' AND json_valid(details_json)
+                       AND json_type(details_json, '$.changed.image_scanning') IS NOT NULL)
+                ORDER BY id
+                """
+            ):
+                details = json.loads(row["details_json"] or "{}") if row["details_json"] else {}
+                if row["event_type"] == "dashboard_settings_updated":
+                    latest[row["server_id"]] = bool(details["changed"]["image_scanning"])
+                elif not details.get("target_channel_id"):
+                    latest[row["server_id"]] = row["event_type"] == "image_scanning_enabled"
+            self.connection.execute("UPDATE server_settings SET image_scanning_on=1")
+            self.connection.executemany(
+                "UPDATE server_settings SET image_scanning_on=0 WHERE server_id=?",
+                [(server_id,) for server_id, enabled in latest.items() if not enabled],
+            )
+            self.connection.execute(
+                "INSERT INTO app_metadata(key, value) VALUES ('image_scanning_default_on_v1', '1')"
             )
         onboarding_redesign_reset = self.connection.execute(
             """
@@ -8397,10 +8427,10 @@ class ModerationDatabase:
     def set_image_scanning(self, server_id: str, enabled: bool) -> None:
         self.connection.execute(
             """
-            INSERT INTO server_settings(server_id, image_scanning_enabled)
+            INSERT INTO server_settings(server_id, image_scanning_on)
             VALUES (?, ?)
             ON CONFLICT(server_id) DO UPDATE SET
-                image_scanning_enabled=excluded.image_scanning_enabled
+                image_scanning_on=excluded.image_scanning_on
             """,
             (server_id, int(enabled)),
         )
@@ -8450,12 +8480,12 @@ class ModerationDatabase:
                 return override
         row = self.connection.execute(
             """
-            SELECT image_scanning_enabled FROM server_settings
+            SELECT image_scanning_on FROM server_settings
             WHERE server_id=?
             """,
             (server_id,),
         ).fetchone()
-        return False if row is None else bool(row["image_scanning_enabled"])
+        return True if row is None else bool(row["image_scanning_on"])
 
     def set_moderator_exemption(self, server_id: str, enabled: bool) -> None:
         self.connection.execute(
