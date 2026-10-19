@@ -1,0 +1,8 @@
+[Unit]
+Description=Stoatmod watchdog (AI tunnel, bot heartbeat, services, disk)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/stoatmod/ops/stoatmod_watchdog.py
+TimeoutStartSec=150

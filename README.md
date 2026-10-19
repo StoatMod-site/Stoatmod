@@ -45,6 +45,9 @@ Then start the bot and API from the repository root, in separate terminals:
 ```
 
 Example systemd units are in `deploy/`. Serve the website and `/api/` through one origin.
+`deploy/stoatmod-watchdog.timer` runs `ops/stoatmod_watchdog.py` every minute: it checks the bot heartbeat, the AI
+endpoint, the services and disk space, restarts an AI tunnel if you use one, and can post uptime alerts to a Stoat
+webhook. Copy `ops/watchdog.env.example` to `/opt/stoatmod/ops/watchdog.env` to configure it.
 For an HTTPS deployment, set `DASHBOARD_ALLOWED_ORIGIN` to that public origin and
 `DASHBOARD_SECURE_COOKIES=true` in `api/.env`; the example defaults are for local development.
 
