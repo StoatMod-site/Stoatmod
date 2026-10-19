@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import logging
 import math
 import socket
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from moderation_policy import (
 
 if TYPE_CHECKING:
     import aiohttp
+
+logger = logging.getLogger("stoat_moderator")
 
 
 class ModerationError(RuntimeError):
@@ -120,6 +123,10 @@ class StoatGuardModerator:
             self._session = self._aiohttp.ClientSession(timeout=self.timeout)
         try:
             await self.verify_health()
+        except ModerationError:
+            # Start anyway: commands, logs and the non-AI protections keep working, and each scan
+            # fails open until the classifier answers again (every response is version-checked).
+            logger.warning("stoatguard_unavailable_at_startup", exc_info=True)
         except BaseException:
             if self._owns_session and self._session is not None:
                 await self._session.close()
