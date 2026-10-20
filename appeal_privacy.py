@@ -247,6 +247,22 @@ class AppealPrivacyStore:
             return any((key in CONTENT_KEYS and item not in (None,'',[],{})) or AppealPrivacyStore._has_content(item) for key,item in value.items())
         return isinstance(value,list) and any(AppealPrivacyStore._has_content(item) for item in value)
 
+    def _expire_attachments(self, *, cutoff: str) -> int:
+        """Uploaded files and images (report evidence, support email, case notes incl. flagged-image copies, appeal
+        messages) are kept for at most 30 days, unless a submitted appeal still needs its case's files."""
+        statements=[
+            ('DELETE FROM user_report_attachments WHERE report_id IN (SELECT id FROM user_reports WHERE created_at<=?)',(cutoff,)),
+            ('DELETE FROM email_attachments WHERE created_at<=?',(cutoff,)),
+            ("""DELETE FROM moderation_case_entry_attachments WHERE created_at<=? AND entry_id NOT IN (
+                SELECT entry.id FROM moderation_case_entries AS entry JOIN appeals AS appeal
+                  ON appeal.server_id=entry.server_id AND appeal.case_reference=entry.case_reference
+                WHERE appeal.status='submitted')""",(cutoff,)),
+            ("""DELETE FROM appeal_message_attachments WHERE created_at<=? AND message_id NOT IN (
+                SELECT message.id FROM appeal_messages AS message JOIN appeals AS appeal ON appeal.id=message.appeal_id
+                WHERE appeal.status='submitted')""",(cutoff,)),
+        ]
+        return sum(self.connection.execute(sql,params).rowcount for sql,params in statements)
+
     def _open_appeal_messages(self) -> set[tuple[str,str]]:
         protected: set[tuple[str,str]]=set()
         for appeal in self.connection.execute("SELECT * FROM appeals WHERE case_kind='moderation' AND server_id IS NOT NULL AND status='submitted'").fetchall():
@@ -310,6 +326,7 @@ class AppealPrivacyStore:
                 self.purge_message(row['server_id'],row['message_id'],now=now)
                 result['expired_messages']+=1
         result['expired_event_content']=self._expire_event_content(now=now,cutoff=cutoff)
+        result['expired_attachments']=self._expire_attachments(cutoff=cutoff)
         result['expired_contributions']=self.connection.execute('DELETE FROM appeal_ai_contributions WHERE expires_at<=?',(now.isoformat(),)).rowcount
         self.connection.commit()
         self.checkpoint()

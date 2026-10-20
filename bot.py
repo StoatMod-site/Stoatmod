@@ -16,6 +16,7 @@ import unicodedata
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 import stoat
 import tldextract
 from PIL import Image, ImageDraw, ImageFont
@@ -43,6 +44,7 @@ from moderation import ModerationError, ModerationResult, StoatGuardModerator
 from moderation_policy import MIN_ACTION_SCORE, SUPPORT_CATEGORY, SUPPORT_ONLY_CATEGORIES
 
 from case_notice import CASE_NOTICE_GRACE_SECONDS, CaseNotice
+from case_images import CASE_IMAGE_AUTHOR, case_copy, note_text, treatment as case_image_treatment
 from admin_credentials import ADMIN_PASSWORD_LIFETIME_DAYS, generate_temporary_password, hash_password
 from application_flow import ApplicationFlow
 from reaction_role_flow import ReactionRoleFlow
@@ -10177,6 +10179,9 @@ class ModerationBot(stoat.Client):
                 details={"mode": "enforce", "categories": categories, "policy_matches": policy_matches},
             )
             return
+        # Removed gore/nudity images are kept with the case (nudity only as a permanently blurred thumbnail) for 30 days.
+        # The download starts now so the file is fetched before the message and its attachment are deleted.
+        case_image_downloads = self._start_case_image_downloads(images, blocked)
         warning_id: int | None = None
         if should_warn:
             reason = "Automatic content moderation: " + ", ".join(
@@ -10391,7 +10396,7 @@ class ModerationBot(stoat.Client):
             60, self._bot_deleted_ids.discard, message.id
         )
 
-        self.database.add_event(
+        deletion_event_id = self.database.add_event(
             server_id=server_id,
             event_type="automatic_deletion",
             user_id=message.author_id,
@@ -10409,6 +10414,9 @@ class ModerationBot(stoat.Client):
                 "scores": aggregate_scores,
                 "total_warnings": total,
             },
+        )
+        await self._store_case_images(
+            server_id, warning_id, deletion_event_id, case_image_downloads
         )
         await self.send_log(
             server_id,
@@ -10431,6 +10439,78 @@ class ModerationBot(stoat.Client):
             await self._enforce_warning_policy_and_notify(
                 server, server_id, message.author_id, warning_id, total
             )
+
+    def _start_case_image_downloads(
+        self, images: list[tuple[str, str]], blocked: list
+    ) -> list[tuple[set[str], asyncio.Task]]:
+        urls = dict(images)
+        downloads: list[tuple[set[str], asyncio.Task]] = []
+        for content_id, _result, matches in blocked:
+            url = urls.get(content_id)
+            categories = {str(match["category"]) for match in matches}
+            if url and case_image_treatment(categories) is not None:
+                downloads.append((categories, asyncio.create_task(self._download_case_image(url))))
+        return downloads
+
+    async def _download_case_image(self, url: str) -> bytes | None:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        try:
+            ipaddress.ip_address(host)
+            return None  # never fetch raw IP addresses (link previews are user-controlled)
+        except ValueError:
+            pass
+        if parsed.scheme != "https" or not host or host == "localhost" or host.endswith(".localhost"):
+            return None
+        limit = self.moderation_settings.max_image_bytes
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status != 200:
+                        return None
+                    data = await response.content.read(limit + 1)
+        except Exception:  # noqa: BLE001 - keeping a copy is best effort
+            logger.warning("case_image_download_failed host=%s", host)
+            return None
+        return data if 0 < len(data) <= limit else None
+
+    async def _store_case_images(
+        self,
+        server_id: str,
+        warning_id: int | None,
+        event_id: int | None,
+        downloads: list[tuple[set[str], asyncio.Task]],
+    ) -> None:
+        if not downloads:
+            return
+        try:
+            case = (
+                self.database.get_warning_case(server_id, warning_id)
+                if warning_id is not None
+                else self.database.get_event_case(server_id, event_id) if event_id else None
+            )
+            attachments: list[tuple[str, str, bytes]] = []
+            for categories, download in downloads:
+                data = await download
+                copy = await asyncio.to_thread(case_copy, data, categories) if data else None
+                if copy is not None:
+                    attachments.append(copy)
+            if case is None or not attachments:
+                return
+            self.database.add_moderation_case_entry(
+                server_id,
+                case.reference_id,
+                "note",
+                note_text(name for name, _type, _data in attachments),
+                CASE_IMAGE_AUTHOR,
+                attachments=attachments,
+            )
+        except Exception:  # noqa: BLE001 - the moderation action already happened
+            logger.exception("case_image_store_failed server_id=%s", server_id)
+        finally:
+            for _categories, download in downloads:
+                if not download.done():
+                    download.cancel()
 
     def log_result(self, message: stoat.Message, content_id: str, result: ModerationResult) -> None:
         _server, server_id = message.get_server()

@@ -231,6 +231,21 @@ class AppealPrivacyTests(unittest.TestCase):
         self.db.connection.commit()
         return event_id
 
+    def test_uploaded_files_expire_after_30_days(self):
+        c = self.db.connection
+        old, recent = (self.now - timedelta(days=31)).isoformat(), (self.now - timedelta(days=5)).isoformat()
+        c.execute("INSERT INTO email_attachments(reply_id,filename,content_type,content,size,created_at) VALUES (1,'a.png','image/png',x'00',1,?)", (old,))
+        c.execute("INSERT INTO email_attachments(reply_id,filename,content_type,content,size,created_at) VALUES (1,'b.png','image/png',x'00',1,?)", (recent,))
+        for reference in ("OLDCASE", "NEWCASE"):
+            entry = c.execute("INSERT INTO moderation_case_entries(server_id,case_reference,entry_type,content,created_by,created_at) VALUES ('server',?,'note','n','mod',?)", (reference, old)).lastrowid
+            c.execute("INSERT INTO moderation_case_entry_attachments(entry_id,filename,content_type,data,size,created_at) VALUES (?,'flagged-gore.jpg','image/jpeg',x'00',1,?)", (entry, old if reference == "OLDCASE" else recent))
+        c.commit()
+        result = self.db.appeal_privacy.prune(now=self.now)
+        self.assertEqual(result["expired_attachments"], 2)
+        self.assertEqual([row[0] for row in c.execute("SELECT filename FROM email_attachments")], ["b.png"])
+        remaining = c.execute("SELECT e.case_reference FROM moderation_case_entry_attachments a JOIN moderation_case_entries e ON e.id=a.entry_id").fetchall()
+        self.assertEqual([row[0] for row in remaining], ["NEWCASE"])
+
     def test_message_content_in_every_event_type_expires_after_30_days(self):
         old = [
             self.add_aged_event("automatic_link_deletion", 31, message_id="m-link"),
