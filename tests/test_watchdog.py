@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -58,6 +59,17 @@ class WatchdogTests(unittest.TestCase):
         for private in ("model-x", "203.0.113", "/opt", "ssh", "SSH", "tunnel", "disk", "GPU"):
             self.assertNotIn(private, text)
         self.assertIn(["systemctl", "restart", "ai-tunnel"], self.commands)
+
+    def test_planned_maintenance_is_announced_as_maintenance(self) -> None:
+        self.ops["PLANNED_MAINTENANCE"] = "AI moderation|2000-01-01T00:00:00Z|2999-01-01T00:00:00Z; bad entry"
+        watchdog.check_ai = lambda env: "AI down " + SECRET
+        for _ in range(4):
+            watchdog.main()
+        self.assertEqual([title for title, _ in self.sent], ["AI moderation: planned maintenance"])
+        self.assertIn("planned maintenance", self.sent[0][1])
+        self.assertFalse(watchdog.in_planned_maintenance(self.ops, "Stoatmod bot", time.time()))
+        self.ops["PLANNED_MAINTENANCE"] = "AI moderation|2000-01-01T00:00:00Z|2000-01-02T00:00:00Z"
+        self.assertFalse(watchdog.in_planned_maintenance(self.ops, "AI moderation", time.time()))
 
     def test_disk_problems_are_never_posted(self) -> None:
         watchdog.check_disk = lambda: "disk 99% full"

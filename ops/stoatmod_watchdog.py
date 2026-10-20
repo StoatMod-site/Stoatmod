@@ -42,6 +42,21 @@ PUBLIC_DOWN = {
 }
 
 
+def in_planned_maintenance(ops: dict[str, str], component: str, now: float) -> bool:
+    """PLANNED_MAINTENANCE="AI moderation|2026-10-21T18:00:00Z|2026-10-21T22:00:00Z; ..." (component|start|end, UTC)."""
+    for window in ops.get("PLANNED_MAINTENANCE", "").split(";"):
+        parts = [part.strip() for part in window.split("|")]
+        if len(parts) != 3 or parts[0] != component:
+            continue
+        try:
+            start, end = (datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() for value in parts[1:])
+        except ValueError:
+            continue
+        if start <= now < end:
+            return True
+    return False
+
+
 def format_minutes(minutes: int) -> str:
     if minutes < 90:
         return f"{minutes} minutes"
@@ -224,8 +239,12 @@ def main() -> int:
             due = entry["minutes"] >= ALERT_AFTER_MINUTES and now - entry.get("alerted_at", 0) >= REPEAT_HOURS * 3600
             if due and webhook:
                 try:
-                    post_alert(webhook, f"{component}: outage", f"{PUBLIC_DOWN[component]} Down for about "
-                               f"{format_minutes(entry['minutes'])}. It is being repaired automatically.", "#ED4245")
+                    if in_planned_maintenance(ops, component, now):
+                        post_alert(webhook, f"{component}: planned maintenance", f"{PUBLIC_DOWN[component]} "
+                                   "This is planned maintenance; see the status page for the expected end time.", "#5B8DEF")
+                    else:
+                        post_alert(webhook, f"{component}: outage", f"{PUBLIC_DOWN[component]} Down for about "
+                                   f"{format_minutes(entry['minutes'])}. It is being repaired automatically.", "#ED4245")
                     entry["alerted_at"] = now
                 except Exception as exc:  # noqa: BLE001 - alerting must never crash the watchdog
                     log(f"alert failed: {type(exc).__name__}")
