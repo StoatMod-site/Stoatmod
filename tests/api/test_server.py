@@ -285,7 +285,22 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("approved_at", listed[0])
         self.assertIn("last_bumped_at", listed[0])
 
+        # Each public listing has a social card; media downloads are mocked so the test stays offline.
+        with patch("api.server._fetch_discovery_media", new=AsyncMock(return_value=None)) as media:
+            card = await self.client.get("/api/public/discovery/og/server.png")
+            self.assertEqual(card.status, 200)
+            self.assertEqual(card.content_type, "image/png")
+            self.assertIn("max-age", card.headers["Cache-Control"])
+            with Image.open(io.BytesIO(await card.read())) as image:
+                self.assertEqual(image.size, (1200, 630))
+            cached = await self.client.get("/api/public/discovery/og/server.png")
+            self.assertEqual(cached.status, 200)
+            self.assertEqual(media.await_count, 2)  # icon + banner fetched once, then served from cache
+            self.assertEqual((await self.client.get("/api/public/discovery/og/missing.png")).status, 404)
+            self.assertEqual((await self.client.get("/api/public/discovery/og/bad-id!.png")).status, 404)
+
         self.database.set_public_stats_enabled("server", False)
+        self.assertEqual((await self.client.get("/api/public/discovery/og/server.png")).status, 404)
         hidden = await self.client.get("/api/public/discovery")
         self.assertEqual((await hidden.json())["servers"], [])
 

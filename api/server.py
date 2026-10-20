@@ -43,6 +43,7 @@ from database import (  # noqa: E402
 )
 from admin_credentials import hash_password
 from api.status_history import read_history  # noqa: E402
+from api.discovery_og import render_server_card  # noqa: E402
 
 
 SESSION_COOKIE = "stoat_dashboard_session"
@@ -699,6 +700,62 @@ async def bump_discovery_listing(request: web.Request) -> web.Response:
         **database.get_discovery_application(server_id),
         "bump": bump,
     })
+
+
+DISCOVERY_OG_TTL_SECONDS = 3 * 60 * 60
+DISCOVERY_OG_MAX_MEDIA_BYTES = 8 * 1024 * 1024
+_discovery_og_cache: dict[str, tuple[float, tuple[Any, ...], bytes]] = {}
+
+
+async def _fetch_discovery_media(session: ClientSession, url: Any) -> bytes | None:
+    """Server icons and banners only come from Stoat's media host."""
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "stoatusercontent.com" or host.endswith(".stoatusercontent.com")):
+        return None
+    try:
+        async with session.get(parsed.geturl(), allow_redirects=False) as response:
+            if response.status != 200:
+                return None
+            data = await response.content.read(DISCOVERY_OG_MAX_MEDIA_BYTES + 1)
+    except Exception:  # noqa: BLE001 - the card falls back to the plain design
+        return None
+    return data if 0 < len(data) <= DISCOVERY_OG_MAX_MEDIA_BYTES else None
+
+
+async def public_discovery_og(request: web.Request) -> web.Response:
+    """1200x630 social image for a public Discovery listing (og:image of its profile page)."""
+    server_id = request.match_info["server_id"]
+    if not server_id.isalnum() or len(server_id) > 64:
+        raise web.HTTPNotFound()
+    server = next(
+        (item for item in _database(request).list_public_discovery_servers() if str(item.get("server_id", "")).lower() == server_id.lower()),
+        None,
+    )
+    if server is None:
+        raise web.HTTPNotFound()
+    key = tuple(server.get(name) for name in ("server_name", "description", "server_icon_url", "server_banner_url", "member_count", "global_rank"))
+    cached = _discovery_og_cache.get(server["server_id"])
+    now = time.monotonic()
+    if cached and cached[1] == key and now - cached[0] < DISCOVERY_OG_TTL_SECONDS:
+        body = cached[2]
+    else:
+        async with ClientSession(timeout=ClientTimeout(total=8), headers={"User-Agent": "Stoatmod/1.0 (+https://modstoat.site)"}) as session:
+            icon, banner = await asyncio.gather(
+                _fetch_discovery_media(session, server.get("server_icon_url")),
+                _fetch_discovery_media(session, server.get("server_banner_url")),
+            )
+        body = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: render_server_card(server, icon=icon, banner=banner)
+        )
+        if len(_discovery_og_cache) > 500:
+            _discovery_og_cache.clear()
+        _discovery_og_cache[server["server_id"]] = (now, key, body)
+    return web.Response(
+        body=body,
+        content_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600, stale-while-revalidate=86400"},
+    )
 
 
 async def public_discovery(request: web.Request) -> web.Response:
@@ -3436,6 +3493,7 @@ def create_app(database_path: str = DATABASE_PATH) -> web.Application:
     app.router.add_get("/api/public/status", public_system_status)
     app.router.add_get("/api/public/stats", public_stats)
     app.router.add_get("/api/public/discovery", public_discovery)
+    app.router.add_get("/api/public/discovery/og/{server_id}.png", public_discovery_og)
     app.router.add_get("/api/verification", verification_status)
     app.router.add_post("/api/verification/complete", complete_verification)
     app.router.add_get("/api/applications/settings", application_settings)
