@@ -15,6 +15,20 @@ SERVICE_NAMES = {
     "dashboard": "Moderator dashboard", "database": "Moderation database", "email": "Email service",
 }
 STATUSES = {"operational", "degraded", "outage", "unknown"}
+# Days are graded by how long the service was actually down, so a short blip does not paint a whole day red.
+# Every interruption is still listed in the incident log and the day's details.
+MINOR_DOWNTIME_SECONDS = 5 * 60  # less than this in a day: operational
+MAJOR_DOWNTIME_SECONDS = 60 * 60  # this or more: outage; in between: degraded (partial disruption)
+DEGRADED_GRACE_SECONDS = 30 * 60  # slow-but-up time before a day counts as degraded
+
+
+def day_state(observed: float, outage: float, degraded: float, restart: float) -> str:
+    downtime = outage + restart
+    if downtime >= MAJOR_DOWNTIME_SECONDS:
+        return "outage"
+    if downtime >= MINOR_DOWNTIME_SECONDS or degraded >= DEGRADED_GRACE_SECONDS:
+        return "degraded"
+    return "operational" if observed else "unknown"
 
 
 def iso(timestamp: float) -> str:
@@ -79,6 +93,16 @@ class StatusHistory:
             cutoff = now - (RETENTION_DAYS + 1) * 86400
             self.connection.execute("DELETE FROM status_intervals WHERE ended_at < ?", (cutoff,))
 
+    def import_restart(self, service: str, start: float, end: float):
+        """Import a bounded stop/start window; never claim surrounding uptime."""
+        if service not in SERVICE_NAMES or end <= start:
+            raise ValueError("Invalid recorded service restart")
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO status_intervals(service,status,started_at,ended_at,last_seen,end_reason,source) VALUES (?,'outage',?,?,?,'recovered','service_log')",
+                (service, start, end, end),
+            )
+
 
 def read_history(path: str | Path, *, days: int = 30, now: float | None = None) -> dict:
     now = time.time() if now is None else now
@@ -117,8 +141,9 @@ def read_history(path: str | Path, *, days: int = 30, now: float | None = None) 
             for status in seconds:
                 total[status] += seconds[status]
             recorded_restart = sum(max(0, min(right, row["ended_at"]) - max(left, row["started_at"])) for row in logs)
-            state = "outage" if seconds["outage"] or recorded_restart else "degraded" if seconds["degraded"] else "operational" if covered else "unknown"
+            state = day_state(covered, seconds["outage"], seconds["degraded"], recorded_restart)
             history_days.append({"date": iso(left)[:10], "status": state, "observed_seconds": round(covered, 1),
+                                 "downtime_seconds": round(seconds["outage"] + recorded_restart, 1),
                                  "outage_seconds": round(seconds["outage"], 1), "degraded_seconds": round(seconds["degraded"], 1),
                                  "restart_seconds": round(recorded_restart, 3), "coverage_percent": round(100 * covered / max(1, right - left), 2)})
         covered = sum(total.values())

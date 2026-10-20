@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
-from api.status_history import StatusHistory, read_history
+from api.status_history import StatusHistory, day_state, read_history
 from api.status_monitor import collect, service, model_health_url
 from api.server import create_app, DATABASE_KEY, STATUS_HISTORY_PATH_KEY
 
@@ -36,6 +36,25 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(report["incidents"][0]["resolution"], "recovered")
         self.assertEqual(report["incidents"][0]["duration_seconds"], 60)
         self.assertEqual(report["services"]["bot"]["days"][0]["status"], "unknown")
+
+    def test_days_are_graded_by_how_long_the_service_was_down(self):
+        self.assertEqual(day_state(86_400, 120, 0, 0), "operational")  # a 2 minute blip stays green
+        self.assertEqual(day_state(86_400, 0, 0, 30), "operational")  # a quick restart stays green
+        self.assertEqual(day_state(86_400, 0, 600, 0), "operational")  # 10 slow minutes stay green
+        self.assertEqual(day_state(86_400, 299, 0, 0), "operational")
+        self.assertEqual(day_state(86_400, 300, 0, 0), "degraded")
+        self.assertEqual(day_state(86_400, 0, 1800, 0), "degraded")
+        self.assertEqual(day_state(86_400, 3000, 0, 600), "outage")  # restarts count as downtime
+        self.assertEqual(day_state(0, 0, 0, 30), "unknown")  # a logged restart alone does not claim monitored uptime
+        self.assertEqual(day_state(0, 0, 0, 7200), "outage")
+
+    def test_short_outage_keeps_the_day_operational_but_is_still_listed(self):
+        for offset in range(0, 3600, 30):
+            self.record(offset, "outage" if 600 <= offset < 720 else "operational")
+        day = read_history(self.path, now=START + 3600)["services"]["bot"]["days"][-1]
+        self.assertEqual(day["status"], "operational")
+        self.assertEqual(day["downtime_seconds"], 120)
+        self.assertEqual(read_history(self.path, now=START + 3600)["incident_count"], 1)
 
     def test_monitor_gap_is_not_counted_as_uptime_or_downtime(self):
         self.record(0, "operational")
