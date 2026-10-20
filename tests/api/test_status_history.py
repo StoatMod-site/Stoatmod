@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
 from api.status_history import StatusHistory, day_state, read_history
-from api.status_monitor import collect, service, model_health_url
+from api.status_monitor import collect, model_health_url, probe, service
 from api.server import create_app, DATABASE_KEY, STATUS_HISTORY_PATH_KEY
 
 START = datetime(2026, 9, 30, 12, tzinfo=timezone.utc).timestamp()
@@ -109,6 +109,14 @@ class HistoryTests(unittest.TestCase):
 
 
 class MonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_single_dropped_check_is_retried_before_it_counts(self):
+        with patch("api.status_monitor.RETRY_DELAY", 0), patch("api.status_monitor._probe_once", new=AsyncMock(side_effect=[(None, None), ({"ok": True}, 5)])) as once:
+            self.assertEqual(await probe(None, "http://model/health"), ({"ok": True}, 5))
+        self.assertEqual(once.await_count, 2)
+        with patch("api.status_monitor.RETRY_DELAY", 0), patch("api.status_monitor._probe_once", new=AsyncMock(return_value=(None, None))) as once:
+            self.assertEqual(await probe(None, "http://model/health"), (None, None))
+        self.assertEqual(once.await_count, 2)
+
     def test_model_address_follows_current_configuration(self):
         with patch.dict("os.environ", {"LOCAL_AI_BASE_URL":"http://127.0.0.1:18006"}, clear=True):
             self.assertEqual(model_health_url(), "http://127.0.0.1:18006/health")

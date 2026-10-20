@@ -37,7 +37,19 @@ def service(key, status, detail, *, now=None, **extra):
             "updated_at": iso(time.time() if now is None else now), **extra}
 
 
-async def probe(session, url, *, expect_json=True):
+RETRY_DELAY = 3  # one dropped request or a restart blip should not be recorded as 30 seconds of downtime
+
+
+async def probe(session, url, *, expect_json=True, retries=1):
+    for attempt in range(retries + 1):
+        payload, elapsed = await _probe_once(session, url, expect_json=expect_json)
+        if payload is not None or attempt == retries:
+            return payload, elapsed
+        await asyncio.sleep(RETRY_DELAY)
+    return None, None
+
+
+async def _probe_once(session, url, *, expect_json=True):
     start = time.monotonic()
     try:
         async with session.get(url, allow_redirects=False) as response:
