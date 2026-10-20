@@ -1348,6 +1348,62 @@ class ModerationBotHelperTests(unittest.TestCase):
         self.assertEqual(result, ([], ["No permission"]))
         server.ban.assert_not_awaited()
 
+    @staticmethod
+    def _not_elevated() -> Exception:
+        exc = stoat.errors.Forbidden.__new__(stoat.errors.Forbidden)
+        exc.type = "NotElevated"
+        return exc
+
+    def test_global_ban_reports_a_bot_role_below_the_member_and_tells_the_owner(self) -> None:
+        bot = ModerationBot.__new__(ModerationBot)
+        server = SimpleNamespace(id="server", name="Pineapple", owner_id="owner",
+                                 fetch_bans=AsyncMock(return_value=[]),
+                                 ban=AsyncMock(side_effect=self._not_elevated()))
+        bot._ready_event_servers = {server.id: server}
+        bot._global_ban_removal_suppressions = set()
+        bot._server_has_member = AsyncMock(return_value=True)
+        bot.require_action_permissions = AsyncMock(return_value=True)
+        bot.database = SimpleNamespace(
+            get_log_channel=Mock(return_value=None),
+            list_server_permission_notices=Mock(return_value=set()),
+            record_server_permission_notices=Mock(),
+        )
+        bot._send_user_dm = AsyncMock(return_value=True)
+        with self.assertNoLogs("stoat_moderator", level="ERROR"):
+            result = asyncio.run(bot._apply_global_ban_to_servers("sweet", "scam", reference_id="ABC123"))
+        self.assertEqual(result, ([], ["Pineapple (Stoatmod's role is too low)"]))
+        self.assertIn("move it above your members' roles", bot._send_user_dm.await_args.args[2])
+        bot.database.record_server_permission_notices.assert_called_once_with(
+            "server", ["role_hierarchy"], "dm:owner", refresh_existing=True
+        )
+
+    def test_role_notice_repeats_at_most_once_a_day(self) -> None:
+        bot = ModerationBot.__new__(ModerationBot)
+        server = SimpleNamespace(id="server", name="Pineapple", owner_id="owner")
+        bot.database = SimpleNamespace(
+            list_server_permission_notices=Mock(return_value={"role_hierarchy"}),
+            record_server_permission_notices=Mock(),
+        )
+        bot._deliver_server_notice = AsyncMock()
+        asyncio.run(bot._notify_role_too_low(server, "sweet"))
+        bot.database.list_server_permission_notices.assert_called_once_with("server", within_seconds=86_400)
+        bot._deliver_server_notice.assert_not_awaited()
+
+    def test_periodic_sync_tells_the_owner_when_the_bot_role_is_too_low(self) -> None:
+        bot = ModerationBot.__new__(ModerationBot)
+        server = SimpleNamespace(id="server", name="Pineapple", fetch_bans=AsyncMock(return_value=[]),
+                                 ban=AsyncMock(side_effect=self._not_elevated()))
+        record = SimpleNamespace(user_id="sweet", reference_id="ABC123", reason="scam", created_by="owner")
+        bot.database = SimpleNamespace(list_global_bans=Mock(return_value=[record]), add_event=Mock())
+        bot._global_ban_removal_suppressions = set()
+        bot._server_has_member = AsyncMock(return_value=True)
+        bot.require_action_permissions = AsyncMock(return_value=True)
+        bot._notify_role_too_low = AsyncMock()
+        with self.assertNoLogs("stoat_moderator", level="ERROR"):
+            asyncio.run(bot.sync_global_bans([server]))
+        bot._notify_role_too_low.assert_awaited_once_with(server, "sweet")
+        bot.database.add_event.assert_not_called()
+
     def test_dashboard_keyword_automation_deletes_matching_message(self) -> None:
         bot = ModerationBot.__new__(ModerationBot)
         bot.database = SimpleNamespace(

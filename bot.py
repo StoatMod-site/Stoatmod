@@ -115,6 +115,12 @@ GLOBAL_COMMAND_USAGES: dict[str, str] = {
 GLOBAL_COMMANDS = set(GLOBAL_COMMAND_USAGES)
 GLOBAL_REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 GLOBAL_BAN_PERMISSION_NOTICE_SECONDS = 24 * 60 * 60
+ROLE_HIERARCHY_NOTICE = "role_hierarchy"
+
+
+def _is_not_elevated(exc: BaseException) -> bool:
+    """Stoat refuses actions on members ranked at or above the bot's highest role."""
+    return isinstance(exc, stoat.errors.Forbidden) and getattr(exc, "type", None) == "NotElevated"
 ZERO_TOLERANCE_USERNAME_SLURS = ("nigger", "faggot", "fag", "kike")
 ZERO_TOLERANCE_USERNAME_BAN_REASON = (
     "Automatic account-username global ban: literal zero-tolerance slur match"
@@ -5843,38 +5849,9 @@ class ModerationBot(stoat.Client):
                 else "Each missing permission is reported only once."
             )
         )
-        log_channel_id = self.database.get_log_channel(server.id)
-        if not log_channel_id:
-            delivered_to = await self._send_permission_notice_to_owner(
-                server, description
-            )
-        else:
-            channel = self.get_channel(log_channel_id, partial=True)
-            try:
-                await self._send_embed_pages(
-                    channel,
-                    "Stoatmod is missing permissions",
-                    description,
-                    "#F59E0B",
-                )
-            except Exception:
-                try:
-                    await channel.send(
-                        content="Stoatmod is missing permissions\n\n" + description
-                    )
-                except Exception:
-                    logger.info(
-                        "permission_notice_log_channel_failed server_id=%s channel_id=%s",
-                        server.id,
-                        log_channel_id,
-                    )
-                    delivered_to = await self._send_permission_notice_to_owner(
-                        server, description
-                    )
-                else:
-                    delivered_to = log_channel_id
-            else:
-                delivered_to = log_channel_id
+        delivered_to = await self._deliver_server_notice(
+            server, "Stoatmod is missing permissions", description
+        )
         if delivered_to is None:
             return False
         names = [name for name, _label, _impact in missing]
@@ -5893,6 +5870,53 @@ class ModerationBot(stoat.Client):
             delivered_to,
         )
         return False
+
+    async def _deliver_server_notice(
+        self, server: stoat.Server, title: str, description: str
+    ) -> str | None:
+        """Send a setup notice to the log channel, or privately to the owner. Returns where it went."""
+        log_channel_id = self.database.get_log_channel(server.id)
+        if not log_channel_id:
+            return await self._send_permission_notice_to_owner(server, description)
+        channel = self.get_channel(log_channel_id, partial=True)
+        try:
+            await self._send_embed_pages(channel, title, description, "#F59E0B")
+        except Exception:
+            try:
+                await channel.send(content=f"{title}\n\n{description}")
+            except Exception:
+                logger.info(
+                    "permission_notice_log_channel_failed server_id=%s channel_id=%s",
+                    server.id,
+                    log_channel_id,
+                )
+                return await self._send_permission_notice_to_owner(server, description)
+        return log_channel_id
+
+    async def _notify_role_too_low(self, server: stoat.Server, user_id: str) -> None:
+        """Stoat only lets a member ban people ranked below its own highest role (error NotElevated)."""
+        if ROLE_HIERARCHY_NOTICE in self.database.list_server_permission_notices(
+            server.id, within_seconds=GLOBAL_BAN_PERMISSION_NOTICE_SECONDS
+        ):
+            return
+        description = (
+            f"Stoatmod could not ban <@{user_id}> in **{server.name}**: Stoat only lets it act on "
+            "members whose roles rank below Stoatmod's highest role, and Stoatmod's role is not "
+            "above theirs.\n\nGive Stoatmod a role and move it above your members' roles in "
+            "Server settings → Roles. Global bans are retried every hour. This notice repeats at "
+            "most once every 24 hours while the problem continues."
+        )
+        delivered_to = await self._deliver_server_notice(
+            server, "Stoatmod's role is too low", description
+        )
+        if delivered_to is None:
+            return
+        self.database.record_server_permission_notices(
+            server.id, [ROLE_HIERARCHY_NOTICE], delivered_to, refresh_existing=True
+        )
+        logger.warning(
+            "role_hierarchy_notice_sent server_id=%s destination=%s", server.id, delivered_to
+        )
 
     async def _send_permission_notice_to_owner(
         self, server: stoat.Server, description: str
@@ -6240,10 +6264,17 @@ class ModerationBot(stoat.Client):
                     f"{reference_line}**User:** <@{user_id}>\n**Reason:** {reason}",
                     color="#ED4245",
                 )
-            except Exception:
+            except Exception as exc:
                 self._global_ban_removal_suppressions.discard(
                     (server.id, user_id)
                 )
+                if not unban and _is_not_elevated(exc):
+                    failed.append(f"{server.name} (Stoatmod's role is too low)")
+                    logger.warning(
+                        "global_ban_not_elevated server_id=%s user_id=%s", server.id, user_id
+                    )
+                    await self._notify_role_too_low(server, user_id)
+                    continue
                 failed.append(server.name)
                 logger.exception(
                     "global_%s_failed server_id=%s user_id=%s",
@@ -6448,10 +6479,18 @@ class ModerationBot(stoat.Client):
                         f"**Reason:** {record.reason}",
                         color="#ED4245",
                     )
-                except Exception:
+                except Exception as exc:
                     self._global_ban_removal_suppressions.discard(
                         (server.id, record.user_id)
                     )
+                    if _is_not_elevated(exc):
+                        logger.warning(
+                            "global_ban_sync_not_elevated server_id=%s user_id=%s",
+                            server.id,
+                            record.user_id,
+                        )
+                        await self._notify_role_too_low(server, record.user_id)
+                        continue
                     logger.exception(
                         "global_ban_sync_failed server_id=%s user_id=%s",
                         server.id,
