@@ -269,6 +269,15 @@ def _cover(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     return ImageOps.fit(image.convert("RGB"), size, Image.Resampling.LANCZOS)
 
 
+def _tick(draw: ImageDraw.ImageDraw, cx: float, cy: float, radius: float) -> None:
+    """The Discovery verified tick: a green disc with a dark check."""
+    draw.ellipse([_s(cx - radius), _s(cy - radius), _s(cx + radius), _s(cy + radius)], fill=(114, 197, 145))
+    draw.line(
+        [(_s(cx - radius * 0.45), _s(cy + radius * 0.02)), (_s(cx - radius * 0.1), _s(cy + radius * 0.38)), (_s(cx + radius * 0.48), _s(cy - radius * 0.36))],
+        fill=BACKGROUND, width=max(2, _s(radius * 0.22)), joint="curve",
+    )
+
+
 def render_server_card(server: dict, *, icon: bytes | None = None, banner: bytes | None = None) -> bytes:
     banner_image = _load(banner)
     if banner_image is not None:
@@ -305,10 +314,13 @@ def render_server_card(server: dict, *, icon: bytes | None = None, banner: bytes
     image.paste(icon_box, (_s(70), _s(118)), mask)
 
     draw = ImageDraw.Draw(image)
-    font, lines, font_size = _fit(draw, name, NAME, 1000, range(74, 40, -4), 2)
+    verified = bool(server.get("verified"))
+    font, lines, font_size = _fit(draw, name, NAME, 940 if verified else 1000, range(74, 40, -4), 2)
     y = 298
-    for line in lines:
+    for index, line in enumerate(lines):
         draw.text((_s(70), _s(y)), line, font=font, fill=WHITE)
+        if verified and index == len(lines) - 1:
+            _tick(draw, 70 + draw.textlength(line, font=font) / SCALE + 30, y + font_size * 0.6, font_size * 0.3)
         y += font_size * 1.08
     description = clean_text(str(server.get("description") or ""))
     if description:

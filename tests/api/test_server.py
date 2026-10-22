@@ -14,6 +14,7 @@ from aiohttp import FormData
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
+from api.discovery_extras import CheckOutcome, ListingChecks
 from api.server import CSRF_COOKIE, DATABASE_KEY, create_app, _report_webhook_api_url, _report_webhook_payload
 
 
@@ -328,15 +329,18 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             if morsel.key == CSRF_COOKIE
         )
 
-        updated = await self.client.put(
-            "/api/discovery/listing",
-            json={
-                "description": "A legacy approved community that needs a public invite.",
-                "information": "The listing can now be joined.",
-                "invite_url": "https://stt.gg/legacy-community",
-            },
-            headers={"X-CSRF-Token": csrf},
-        )
+        # Approved listings stay approved: the edit goes live once the automatic checks pass.
+        with patch.object(ListingChecks, "invite_server", new=AsyncMock(return_value="server")), \
+                patch.object(ListingChecks, "text", new=AsyncMock(return_value=CheckOutcome(False))):
+            updated = await self.client.put(
+                "/api/discovery/listing",
+                json={
+                    "description": "A legacy approved community that needs a public invite.",
+                    "information": "The listing can now be joined.",
+                    "invite_url": "https://stt.gg/legacy-community",
+                },
+                headers={"X-CSRF-Token": csrf},
+            )
 
         self.assertEqual(updated.status, 200)
         updated_payload = await updated.json()
@@ -344,11 +348,8 @@ class DashboardApiTests(unittest.IsolatedAsyncioTestCase):
             updated_payload["application"]["invite_url"],
             "https://stt.gg/legacy-community",
         )
-        self.assertEqual(updated_payload["application"]["status"], "pending")
-        self.assertEqual(
-            (await (await self.client.get("/api/public/discovery")).json())["servers"],
-            [],
-        )
+        self.assertEqual(updated_payload["application"]["status"], "approved")
+        self.assertEqual(updated_payload["edit"]["status"], "live")
 
     def test_report_webhook_url_is_normalized_to_stoat_api(self) -> None:
         self.assertEqual(

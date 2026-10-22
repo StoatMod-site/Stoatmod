@@ -44,6 +44,7 @@ from database import (  # noqa: E402
 from admin_credentials import hash_password
 from api.status_history import read_history  # noqa: E402
 from api.discovery_og import render_server_card  # noqa: E402
+from api import discovery_extras  # noqa: E402
 
 
 SESSION_COOKIE = "stoat_dashboard_session"
@@ -734,17 +735,23 @@ async def public_discovery_og(request: web.Request) -> web.Response:
     )
     if server is None:
         raise web.HTTPNotFound()
-    key = tuple(server.get(name) for name in ("server_name", "description", "server_icon_url", "server_banner_url", "member_count", "global_rank"))
+    store = request.app[discovery_extras.STORE_KEY]
+    store.enrich([server])
+    key = tuple(str(server.get(name)) for name in ("server_name", "description", "server_icon_url", "server_banner_url", "member_count", "global_rank", "logo_url", "custom_banner_url", "verified"))
     cached = _discovery_og_cache.get(server["server_id"])
     now = time.monotonic()
     if cached and cached[1] == key and now - cached[0] < DISCOVERY_OG_TTL_SECONDS:
         body = cached[2]
     else:
+        logo = store.get_media(server["server_id"], "logo")
+        custom_banner = store.get_media(server["server_id"], "banner")
         async with ClientSession(timeout=ClientTimeout(total=8), headers={"User-Agent": "Stoatmod/1.0 (+https://modstoat.site)"}) as session:
             icon, banner = await asyncio.gather(
-                _fetch_discovery_media(session, server.get("server_icon_url")),
-                _fetch_discovery_media(session, server.get("server_banner_url")),
+                _fetch_discovery_media(session, None if logo else server.get("server_icon_url")),
+                _fetch_discovery_media(session, None if custom_banner else server.get("server_banner_url")),
             )
+        icon = logo["data"] if logo else icon
+        banner = custom_banner["data"] if custom_banner else banner
         body = await asyncio.get_running_loop().run_in_executor(
             None, lambda: render_server_card(server, icon=icon, banner=banner)
         )
@@ -759,9 +766,12 @@ async def public_discovery_og(request: web.Request) -> web.Response:
 
 
 async def public_discovery(request: web.Request) -> web.Response:
-    response = web.json_response(
-        {"servers": _database(request).list_public_discovery_servers()}
-    )
+    store = request.app[discovery_extras.STORE_KEY]
+    servers = store.enrich(_database(request).list_public_discovery_servers())
+    response = web.json_response({
+        "servers": servers,
+        "spotlight": store.spotlight([str(server["server_id"]) for server in servers]),
+    })
     response.headers["Cache-Control"] = "public, max-age=60, stale-while-revalidate=120"
     return response
 
@@ -3538,8 +3548,6 @@ def create_app(database_path: str = DATABASE_PATH) -> web.Application:
         "/api/dashboard/sessions/revoke-all", revoke_all_dashboard_sessions
     )
     app.router.add_get("/api/discovery", discovery_status)
-    app.router.add_post("/api/discovery/apply", apply_for_discovery)
-    app.router.add_put("/api/discovery/listing", update_discovery_listing)
     app.router.add_post("/api/discovery/bump", bump_discovery_listing)
     app.router.add_get("/api/stats", stats)
     app.router.add_get("/api/cases", cases)
@@ -3645,6 +3653,24 @@ def create_app(database_path: str = DATABASE_PATH) -> web.Application:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    discovery_extras.register(
+        app,
+        discovery_extras.Hooks(
+            database=_database,
+            session=_session,
+            require_csrf=_require_csrf,
+            json_error=_json_error,
+            client_ip=_client_ip,
+            listing_fields=_discovery_listing_fields,
+            validate_turnstile=_validate_turnstile,
+            turnstile_configured=lambda: bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY),
+            turnstile_site_key=TURNSTILE_SITE_KEY,
+            system_actor=GLOBAL_COMMAND_OWNER_ID,
+        ),
+        app[DATABASE_KEY].connection,
+        stoat_api_base=STOAT_API_BASE,
+        threshold=DEFAULT_THRESHOLD,
+    )
     app.cleanup_ctx.append(verification_retention)
     app.on_cleanup.append(close_database)
     return app
