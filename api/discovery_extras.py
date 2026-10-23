@@ -79,18 +79,20 @@ VERIFICATION_DENIED_COOLDOWN = timedelta(days=30)
 BUMP_COOLDOWN = timedelta(hours=2)
 
 SLUG_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,30})[a-z0-9]$")
-# Every top-level route of the website, plus names people could mistake for us.
-RESERVED_SLUGS = frozenset({
-    "_next", "_sites-preview", "about", "admin", "api", "app", "appeal", "appeals",
-    "apply", "assets", "auth", "blog", "brand", "changelog", "compare", "contact",
-    "content", "cdn", "dashboard", "discover", "discovery", "docs", "download",
-    "email", "es", "faq", "features", "fr", "guides", "help", "home", "i18n",
-    "invite", "join", "legal", "lib", "login", "logout", "mail", "mod", "moderation",
-    "moderator", "news", "official", "owner", "partner", "partners", "pricing",
-    "privacy", "privacy-changes", "pt", "report", "reports", "security", "server",
-    "servers", "settings", "signin", "signup", "staff", "static", "status",
-    "stoat", "stoatmod", "modstoat", "support", "team", "terms", "tos", "verify",
-    "verified", "www",
+# Top-level routes of the website: never usable as custom links, even by staff.
+SITE_ROUTE_SLUGS = frozenset({
+    "_next", "_sites-preview", "about", "admin", "api", "appeal", "changelog", "compare",
+    "content", "dashboard", "discovery", "docs", "features", "guides", "i18n", "lib",
+    "login", "owner", "privacy", "privacy-changes", "report", "security", "status", "verify",
+})
+# Names people could mistake for Stoatmod or for future pages. Only the Stoatmod team can assign them.
+RESERVED_SLUGS = SITE_ROUTE_SLUGS | frozenset({
+    "app", "appeals", "apply", "assets", "auth", "blog", "brand", "contact", "cdn",
+    "discover", "download", "email", "es", "faq", "fr", "help", "home", "invite", "join",
+    "legal", "logout", "mail", "mod", "moderation", "moderator", "news", "official",
+    "partner", "partners", "pricing", "pt", "reports", "server", "servers", "settings",
+    "signin", "signup", "staff", "static", "stoat", "stoatmod", "modstoat", "support",
+    "team", "terms", "tos", "verified", "www",
 })
 # Names only a verified server may claim, so nobody squats a brand's link.
 PROTECTED_SLUG_WORDS = (
@@ -154,13 +156,17 @@ def normalize_slug(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
-def validate_slug(value: Any, *, verified: bool = False) -> str:
+def validate_slug(value: Any, *, verified: bool = False, staff: bool = False) -> str:
     slug = normalize_slug(value)
     if not SLUG_PATTERN.match(slug) or "--" in slug:
         raise ValueError(
             "Custom links use 3 to 32 lowercase letters, numbers and single hyphens, "
             "and cannot start or end with a hyphen."
         )
+    if slug in SITE_ROUTE_SLUGS:
+        raise ValueError("That link is a page of the Stoatmod website.")
+    if staff:
+        return slug
     if slug in RESERVED_SLUGS:
         raise ValueError("That link is reserved by Stoatmod. Choose another one.")
     if not verified and any(word in slug for word in PROTECTED_SLUG_WORDS):
@@ -635,11 +641,14 @@ class DiscoveryExtrasStore:
             "current_slug": current["slug"] if current else row["slug"],
         }
 
-    def claim_vanity(self, server_id: str, value: Any, *, verified: bool, now: datetime | None = None) -> dict[str, Any]:
+    def claim_vanity(
+        self, server_id: str, value: Any, *, verified: bool, staff: bool = False, now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Give a listing its custom link. Staff may assign reserved names and skip the change cooldown."""
         now = now or utc_now()
         if not self.is_live(server_id):
             raise ValueError("Custom links are available once the listing is approved.")
-        slug = validate_slug(value, verified=verified)
+        slug = validate_slug(value, verified=verified, staff=staff)
         current = self.vanity_for(server_id)
         if current and current["slug"] == slug:
             return current
@@ -648,12 +657,12 @@ class DiscoveryExtrasStore:
         ).fetchone()
         if owner and owner["server_id"] != server_id:
             retired = parse_iso(owner["retired_at"])
-            if not retired or now - retired <= timedelta(days=VANITY_RETIRED_DAYS):
+            if not retired or (not staff and now - retired <= timedelta(days=VANITY_RETIRED_DAYS)):
                 raise ValueError("That custom link is already taken.")
             self.connection.execute("DELETE FROM discovery_vanity WHERE slug=?", (slug,))
         if current:
             created = parse_iso(current["created_at"])
-            if created and now - created < VANITY_CHANGE_COOLDOWN:
+            if not staff and created and now - created < VANITY_CHANGE_COOLDOWN:
                 raise ValueError("You can change the custom link once every 24 hours.")
             self.connection.execute(
                 "UPDATE discovery_vanity SET retired_at=? WHERE slug=?", (iso(now), current["slug"])
