@@ -717,6 +717,16 @@ class DiscoveryExtrasStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def stoat_media(self, server_id: str) -> dict[str, str | None]:
+        row = self.connection.execute(
+            "SELECT server_icon_url, server_banner_url FROM dashboard_server_snapshots WHERE server_id=?",
+            (server_id,),
+        ).fetchone()
+        return {
+            "icon_url": (row["server_icon_url"] or None) if row else None,
+            "banner_url": (row["server_banner_url"] or None) if row else None,
+        }
+
     def media_urls(self, server_id: str) -> dict[str, str | None]:
         rows = self.connection.execute(
             "SELECT kind, digest FROM discovery_media WHERE server_id=?", (server_id,)
@@ -1386,6 +1396,8 @@ async def dashboard_extras(request: web.Request) -> web.Response:
         "verification_request": store.latest_verification(server_id),
         "vanity": store.vanity_for(server_id),
         "media": store.media_urls(server_id),
+        # The icon and banner set on Stoat, used when no custom logo or banner is uploaded.
+        "stoat_media": store.stoat_media(server_id),
         "stats": store.stats(server_id, 30),
         "held_edit": store.held_edit(server_id),
         "edits": store.list_edits(server_id, 10),
