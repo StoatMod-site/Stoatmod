@@ -45,6 +45,7 @@ from admin_credentials import hash_password
 from api.status_history import read_history  # noqa: E402
 from api.discovery_og import render_server_card  # noqa: E402
 from api import discovery_extras  # noqa: E402
+from api import discovery_thumbs  # noqa: E402
 
 
 SESSION_COOKIE = "stoat_dashboard_session"
@@ -709,19 +710,24 @@ _discovery_og_cache: dict[str, tuple[float, tuple[Any, ...], bytes]] = {}
 
 
 async def _fetch_discovery_media(session: ClientSession, url: Any) -> bytes | None:
-    """Server icons and banners only come from Stoat's media host."""
-    parsed = urlparse(str(url or ""))
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not (host == "stoatusercontent.com" or host.endswith(".stoatusercontent.com")):
-        return None
-    try:
-        async with session.get(parsed.geturl(), allow_redirects=False) as response:
-            if response.status != 200:
-                return None
-            data = await response.content.read(DISCOVERY_OG_MAX_MEDIA_BYTES + 1)
-    except Exception:  # noqa: BLE001 - the card falls back to the plain design
-        return None
-    return data if 0 < len(data) <= DISCOVERY_OG_MAX_MEDIA_BYTES else None
+    """Server icons and banners only come from Stoat's media host (following its redirects)."""
+    return await discovery_thumbs.fetch_stoat_media(session, url, max_bytes=DISCOVERY_OG_MAX_MEDIA_BYTES)
+
+
+def _public_listing(request: web.Request, server_id: str) -> dict[str, Any] | None:
+    server = next(
+        (item for item in _database(request).list_public_discovery_servers() if str(item.get("server_id", "")).lower() == server_id.lower()),
+        None,
+    )
+    if server is not None:
+        request.app[discovery_extras.STORE_KEY].enrich([server])
+    return server
+
+
+public_discovery_thumbnail = discovery_thumbs.create_handler(
+    _public_listing,
+    lambda request, server_id, kind: request.app[discovery_extras.STORE_KEY].get_media(server_id, kind),
+)
 
 
 async def public_discovery_og(request: web.Request) -> web.Response:
@@ -3504,6 +3510,7 @@ def create_app(database_path: str = DATABASE_PATH) -> web.Application:
     app.router.add_get("/api/public/stats", public_stats)
     app.router.add_get("/api/public/discovery", public_discovery)
     app.router.add_get("/api/public/discovery/og/{server_id}.png", public_discovery_og)
+    app.router.add_get("/api/public/discovery/thumb/{server_id}/{kind}.webp", public_discovery_thumbnail)
     app.router.add_get("/api/verification", verification_status)
     app.router.add_post("/api/verification/complete", complete_verification)
     app.router.add_get("/api/applications/settings", application_settings)
