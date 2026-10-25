@@ -44,6 +44,7 @@ from database import (  # noqa: E402
 from admin_credentials import hash_password
 from api.status_history import read_history  # noqa: E402
 from api.discovery_og import render_server_card  # noqa: E402
+from image_safety import open_image  # noqa: E402
 from api import discovery_extras  # noqa: E402
 from api import discovery_thumbs  # noqa: E402
 
@@ -927,7 +928,7 @@ async def _case_entry_form(
         if not filename or any(ord(character) < 32 for character in filename):
             raise web.HTTPBadRequest(reason="An evidence image filename is invalid.")
         try:
-            with Image.open(io.BytesIO(data)) as image:
+            with open_image(data) as image:
                 content_type = CASE_EVIDENCE_IMAGE_TYPES.get(
                     str(image.format or "").upper()
                 )

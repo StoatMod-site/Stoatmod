@@ -17,6 +17,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
+from image_safety import open_image
+
 WIDTH, HEIGHT = 1200, 630
 SCALE = 2  # draw at 2x and downsample for smooth lines and text
 BACKGROUND = (5, 5, 5)
@@ -257,7 +259,7 @@ def _load(data: bytes | None) -> Image.Image | None:
     if not data:
         return None
     try:
-        with Image.open(io.BytesIO(data)) as image:
+        with open_image(data) as image:
             image.seek(0)
             image.draft("RGB", (2400, 1260))
             return image.convert("RGBA")

@@ -19,6 +19,8 @@ from urllib.parse import urljoin, urlparse
 from aiohttp import ClientSession, ClientTimeout, web
 from PIL import Image, ImageFile, ImageOps
 
+from image_safety import open_image
+
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_PIXELS = 40_000_000
 WIDTHS = {"icon": (96, 152, 256), "banner": (480, 640, 960, 1200)}
@@ -71,7 +73,7 @@ _truncated_lock = threading.Lock()
 
 
 def _first_frame(data: bytes) -> Image.Image:
-    with Image.open(io.BytesIO(data)) as image:
+    with open_image(data) as image:
         if image.width * image.height > MAX_SOURCE_PIXELS:
             raise ValueError("image too large")
         image.seek(0)

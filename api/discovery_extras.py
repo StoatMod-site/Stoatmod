@@ -284,12 +284,14 @@ def process_media(data: bytes, kind: str) -> bytes:
     """Re-encode an upload: first frame only, EXIF stripped, cropped and resized to WebP."""
     from PIL import Image, ImageOps
 
+    from image_safety import open_image
+
     if not data:
         raise ValueError("Choose an image to upload.")
     if len(data) > MEDIA_MAX_UPLOAD_BYTES:
         raise ValueError("Images must be 2 MB or smaller.")
     try:
-        with Image.open(io.BytesIO(data)) as image:
+        with open_image(data) as image:
             if image.format not in {"PNG", "JPEG", "GIF", "WEBP"}:
                 raise ValueError("Upload a PNG, JPEG, GIF or WebP image.")
             if image.width * image.height > MEDIA_MAX_PIXELS:

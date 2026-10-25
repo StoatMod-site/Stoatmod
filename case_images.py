@@ -13,6 +13,8 @@ from collections.abc import Iterable
 
 from PIL import Image, ImageFilter
 
+from image_safety import open_image
+
 CASE_IMAGE_AUTHOR = "STOATMOD_IMAGE_SCAN"
 NEVER_STORED = frozenset({"sexual/minors"})
 REDUCED_MAX_PX = 1280
@@ -40,7 +42,7 @@ def case_copy(data: bytes, categories: Iterable[str]) -> tuple[str, str, bytes] 
     if kind is None or not data:
         return None
     try:
-        with Image.open(io.BytesIO(data)) as image:
+        with open_image(data) as image:
             image.seek(0)  # first frame of an animation
             frame = image.convert("RGB")
     except Exception:  # noqa: BLE001 - an unreadable image is simply not kept
