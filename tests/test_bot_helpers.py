@@ -1725,6 +1725,45 @@ class ModerationBotHelperTests(unittest.TestCase):
         self.assertEqual(updated, "first")
         self.assertEqual(bot._status_index, 1)
 
+    def test_timed_out_status_request_releases_only_the_status_route_lock(self) -> None:
+        from stoat import routes as stoat_routes
+        from stoat.http import DefaultRateLimiter
+
+        limiter = DefaultRateLimiter()
+        status_route = stoat_routes.USERS_EDIT_SELF_USER.compile()
+        other_route = stoat_routes.USERS_FETCH_SELF.compile()
+        stuck = limiter.fetch_blocker_for(status_route, "/users/@me")
+        other = limiter.fetch_blocker_for(other_route, "/users/@me")
+        asyncio.run(stuck.increment())  # a cancelled request never released it
+
+        bot = object.__new__(ModerationBot)
+        bot._state = SimpleNamespace(http=SimpleNamespace(rate_limiter=limiter))
+
+        self.assertTrue(bot._release_stuck_status_request())
+        self.assertIsNot(limiter.fetch_blocker_for(status_route, "/users/@me"), stuck)
+        self.assertIs(limiter.fetch_blocker_for(other_route, "/users/@me"), other)
+        self.assertFalse(object.__new__(ModerationBot)._release_stuck_status_request())
+
+    def test_status_rotation_backs_off_releases_and_recovers(self) -> None:
+        bot = object.__new__(ModerationBot)
+        bot._update_rotating_status = AsyncMock(side_effect=[TimeoutError(), TimeoutError(), "first", "second"])
+        bot._release_stuck_status_request = Mock(return_value=True)
+        delays = []
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+            if len(delays) == 4:
+                raise asyncio.CancelledError
+
+        with patch("bot.asyncio.sleep", fake_sleep), self.assertLogs("stoat_moderator", "INFO") as logs:
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(bot._rotate_status())
+
+        self.assertEqual(delays, [120, 240, 60, 60])
+        self.assertEqual(bot._release_stuck_status_request.call_count, 2)
+        self.assertEqual(sum("status_rotation_update_failed" in line for line in logs.output), 2)
+        self.assertTrue(any("status_rotation_recovered after_failures=2" in line for line in logs.output))
+
     def test_status_updates_enforce_stoat_user_edit_window(self) -> None:
         bot = object.__new__(ModerationBot)
         bot._last_status_update_attempt = 100.0

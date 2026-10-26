@@ -243,6 +243,8 @@ EVERYONE_MENTION_FLAGS = (1 << 1) | (1 << 2)
 STATUS_ROTATION_SECONDS = 60
 STATUS_UPDATE_TIMEOUT_SECONDS = 30
 STATUS_RESTART_DELAY_SECONDS = 5
+# After repeated failures the status is retried less often, up to this interval.
+STATUS_ROTATION_MAX_BACKOFF_SECONDS = 16 * 60
 DASHBOARD_ACTION_RESTART_DELAY_SECONDS = 5
 DASHBOARD_MEMBER_REFRESH_SECONDS = 60 * 60
 REPORT_NOTIFICATION_RETRY_DELAYS = (15, 60, 300)
@@ -2419,15 +2421,48 @@ class ModerationBot(stoat.Client):
         self._status_index = (self._status_index + 1) % len(statuses)
         return status_text
 
+    def _release_stuck_status_request(self) -> bool:
+        """Drop stoat.py's request lock for the status route after one of our requests timed out.
+
+        stoat.py holds a per-route lock from sending a request until its response arrives. A request
+        cancelled by our timeout never releases it, so every later status edit waits forever. Removing
+        that route's lock lets the next attempt start clean; other routes are untouched.
+        """
+        try:
+            from stoat import routes as stoat_routes
+
+            limiter = self.http.rate_limiter
+            pending = getattr(limiter, "_pending_requests", None)
+            if not isinstance(pending, dict) or limiter is None:
+                return False
+            key = limiter.get_ratelimit_key_for(stoat_routes.USERS_EDIT_SELF_USER.compile())
+        except Exception:  # noqa: BLE001 - a different stoat.py version: nothing to release
+            return False
+        return pending.pop(key, None) is not None
+
     async def _rotate_status(self) -> None:
+        failures = 0
         while True:
             try:
                 await self._update_rotating_status()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("status_rotation_update_failed")
-            await asyncio.sleep(STATUS_ROTATION_SECONDS)
+            except Exception as error:
+                failures += 1
+                released = isinstance(error, TimeoutError) and self._release_stuck_status_request()
+                # The status is cosmetic: one traceback for the first failure, then a short line.
+                logger.warning(
+                    "status_rotation_update_failed attempt=%s error=%s released_stuck_request=%s",
+                    failures, type(error).__name__, released, exc_info=failures == 1,
+                )
+            else:
+                if failures:
+                    logger.info("status_rotation_recovered after_failures=%s", failures)
+                failures = 0
+            delay = STATUS_ROTATION_SECONDS if not failures else min(
+                STATUS_ROTATION_SECONDS * 2 ** min(failures, 5), STATUS_ROTATION_MAX_BACKOFF_SECONDS
+            )
+            await asyncio.sleep(delay)
 
     def dispatch_scan(self, message: stoat.Message, **options: object) -> None:
         task = asyncio.create_task(self.scan_message(message, **options))
