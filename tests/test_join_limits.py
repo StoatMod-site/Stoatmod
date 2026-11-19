@@ -177,6 +177,60 @@ class JoinLimitFlowTests(DatabaseCase):
         self.assertEqual(asyncio.run(self.flow.expire_due(now=datetime.now(timezone.utc) + timedelta(days=2))), 0)
         self.bot._send_user_dm.assert_not_awaited()
 
+    def make_moderator(self):
+        moderator = SimpleNamespace(id="member", permissions=SimpleNamespace(kick_members=True))
+        self.server.permissions_for = Mock(side_effect=lambda member: member.permissions)
+        self.server.get_member = Mock(return_value=moderator)
+        return moderator
+
+    def test_member_who_joins_as_moderator_is_not_limited(self):
+        moderator = self.make_moderator()
+        asyncio.run(self.flow.on_join(self.server, moderator, SimpleNamespace(bot=None)))
+        self.assertIsNone(self.db.join_limits.expires_at("server", "member"))
+        self.bot._send_user_dm.assert_not_awaited()
+
+    def test_server_owner_who_rejoins_is_not_limited(self):
+        self.server.owner_id = "member"
+        self.join()
+        self.assertIsNone(self.db.join_limits.expires_at("server", "member"))
+
+    def test_moderator_granted_after_joining_ends_protection_early(self):
+        self.join()
+        self.make_moderator()
+        self.bot._send_user_dm.reset_mock()
+        message = self.message("look https://example.com/x")
+        self.assertFalse(asyncio.run(self.flow.handle_message(message)))
+        self.bot._delete_automatic_message.assert_not_awaited()
+        self.assertIsNone(self.db.join_limits.expires_at("server", "member"))
+        title, body = self.bot._send_user_dm.await_args.args[1:3]
+        self.assertEqual(title, "Join protection ended early")
+        self.assertIn("privilege escalation", body)
+        self.assertEqual(self.bot.send_log.await_args.args[1], "Join protection ended early")
+        event = self.db.connection.execute(
+            "SELECT details_json FROM moderation_events WHERE event_type='join_protection_ended_early'"
+        ).fetchone()
+        self.assertEqual(json.loads(event[0])["reason"], "moderator_permissions")
+        # Later messages pass without a second notice.
+        self.assertFalse(asyncio.run(self.flow.handle_message(self.message("again https://example.com"))))
+        self.assertEqual(self.bot._send_user_dm.await_count, 1)
+
+    def test_plain_member_is_still_limited_when_permission_check_fails(self):
+        self.join()
+        self.server.get_member = Mock(return_value=SimpleNamespace(id="member"))
+        self.server.permissions_for = Mock(side_effect=RuntimeError("no data"))
+        self.assertTrue(asyncio.run(self.flow.handle_message(self.message("x", attachments=[object()]))))
+        self.assertIsNotNone(self.db.join_limits.expires_at("server", "member"))
+
+    def test_early_end_dm_is_translated(self):
+        title, body = localize_delivery(
+            "fr", "Join protection ended early",
+            "Your join protection in **Cafe** ended early because you were given moderator "
+            "permissions (privilege escalation). You can now send attachments.",
+        )
+        self.assertEqual(title, "La protection d’arrivée a pris fin plus tôt")
+        self.assertNotIn("ended early", body)
+        self.assertNotIn("You can", body)
+
     def test_dms_are_translated(self):
         title, body = localize_delivery(
             "fr", "Join protection has ended",

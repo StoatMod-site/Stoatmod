@@ -2,7 +2,9 @@
 
 A member who joins starts a protection window. Until it ends, their messages with
 links or attachments are removed. They are told by DM when the window starts and
-again when it ends. The only stored record is the server, the member and the
+again when it ends. Moderators are never limited: a member who joins with
+moderator permissions gets no window, and one who is given them later has the
+window ended (and is told why) the next time they send a link or attachment. The only stored record is the server, the member and the
 window times, and it is deleted when the window ends or the member leaves.
 """
 from __future__ import annotations
@@ -154,6 +156,56 @@ class JoinLimitFlow:
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._run_expiry(), name="join-limit-expiry")
 
+    def _is_privileged(self, server: Any, member: Any) -> bool:
+        """Server owners and members with any moderator permission skip join protection."""
+        if member is None:
+            return False
+        owner_id = str(getattr(server, "owner_id", "") or "")
+        if owner_id and str(getattr(member, "id", "") or "") == owner_id:
+            return True
+        try:
+            return bool(self.bot._member_is_moderator(server, member))
+        except Exception:
+            logger.warning(
+                "join_limit_privilege_check_failed server_id=%s user_id=%s",
+                getattr(server, "id", None), getattr(member, "id", None),
+            )
+            return False
+
+    @staticmethod
+    def _message_member(message: Any, server: Any) -> Any | None:
+        get_author_member = getattr(message, "get_author_as_member", None)
+        member = get_author_member() if callable(get_author_member) else None
+        if member is None and callable(getattr(server, "get_member", None)):
+            member = server.get_member(message.author_id)
+        return member
+
+    async def _end_early_for_privilege(self, server: Any, server_id: str, message: Any) -> None:
+        if not self.store.end(server_id, message.author_id):
+            return
+        self.reminded.pop((server_id, message.author_id), None)
+        self.bot.database.add_event(
+            server_id=server_id, event_type="join_protection_ended_early", user_id=message.author_id,
+            actor_id=self.bot.state.my_id, message_id=message.id, channel_id=message.channel_id,
+            details={"reason": "moderator_permissions"},
+        )
+        user_tag = await self.bot._resolve_user_tag(message.author_id, message.get_author_as_user())
+        await self.bot.send_log(
+            server_id,
+            "Join protection ended early",
+            f"**User:** `{user_tag}`\n**Reason:** The member was given moderator permissions "
+            "after joining (privilege escalation), so their links and attachments are no longer limited.",
+            color="#3BA55D",
+        )
+        name = getattr(server, "name", None) or "the server"
+        await self.bot._send_user_dm(
+            message.author_id,
+            "Join protection ended early",
+            f"Your join protection in **{name}** ended early because you were given moderator "
+            "permissions (privilege escalation)." + self._after_text(server_id),
+            server_id=server_id, user=message.get_author_as_user(), color="#3BA55D",
+        )
+
     def _limited_sentence(self, server_id: str) -> str:
         config = self.store.settings(server_id)
         limited = " or ".join(name for name in ("links", "attachments") if config[name])
@@ -178,6 +230,10 @@ class JoinLimitFlow:
         if self.store is None or user is None or getattr(user, "bot", None) is not None:
             return
         if not self.store.active(server_id):
+            return
+        if self._is_privileged(server, member):
+            # A moderator who rejoins keeps their trust; any stale window is cleared.
+            self.store.end(server_id, member.id)
             return
         expires = self.store.start(server_id, member.id)
         await self.bot._send_user_dm(
@@ -213,6 +269,9 @@ class JoinLimitFlow:
             return False
         reason = self.blocked_reason(message, server_id)
         if reason is None:
+            return False
+        if self._is_privileged(server, self._message_member(message, server)):
+            await self._end_early_for_privilege(server, server_id, message)
             return False
         if not await self.bot.require_action_permissions(server, "manage_messages"):
             return True
