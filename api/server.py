@@ -46,6 +46,7 @@ from api.status_history import read_history  # noqa: E402
 from api.discovery_og import render_server_card  # noqa: E402
 from image_safety import open_image  # noqa: E402
 from api import discovery_extras  # noqa: E402
+from api import role_manager  # noqa: E402
 from api import discovery_thumbs  # noqa: E402
 
 
@@ -3678,6 +3679,16 @@ def create_app(database_path: str = DATABASE_PATH) -> web.Application:
         app[DATABASE_KEY].connection,
         stoat_api_base=STOAT_API_BASE,
         threshold=DEFAULT_THRESHOLD,
+    )
+    role_manager.register(
+        app,
+        role_manager.Hooks(
+            database=_database,
+            session=_session,
+            require_csrf=_require_csrf,
+            json_error=_json_error,
+        ),
+        role_manager.StoatRoleClient(STOAT_API_BASE, lambda: STOAT_BOT_TOKEN),
     )
     app.cleanup_ctx.append(verification_retention)
     app.on_cleanup.append(close_database)
