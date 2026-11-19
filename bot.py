@@ -95,6 +95,33 @@ SERVER_COMMAND_USAGES: dict[str, str] = {
     "~exclude": "~exclude CHANNEL_OR_CATEGORY_ID",
     "~include": "~include CHANNEL_OR_CATEGORY_ID",
 }
+# Commands that act on members or change settings need the same permission
+# Stoat would require of the invoker; one moderator permission is not enough.
+COMMAND_REQUIRED_PERMISSIONS: dict[str, str] = {
+    "~mute": "timeout_members",
+    "~unmute": "timeout_members",
+    "~kick": "kick_members",
+    "~ban": "ban_members",
+    "~unban": "ban_members",
+}
+SERVER_SETTINGS_COMMANDS = frozenset({
+    "~policy", "~join-protection", "~auto-role", "~nickname-protection",
+    "~link-protection", "~spam-detection", "~image-scanning",
+    "~moderator-exemption", "~mod-exemption", "~threshold", "~categories",
+    "~log", "~log-channel", "~exclude", "~include",
+})
+SETTINGS_READ_ONLY_OPERATIONS = frozenset({"status", "show", "list"})
+DASHBOARD_ACTION_PERMISSIONS: dict[str, str] = {
+    "mute": "timeout_members",
+    "kick": "kick_members",
+    "ban": "ban_members",
+}
+PERMISSION_LABELS: dict[str, str] = {
+    "timeout_members": "Timeout Members",
+    "kick_members": "Kick Members",
+    "ban_members": "Ban Members",
+    "manage_server": "Manage Server",
+}
 PUBLIC_COMMAND_USAGES: dict[str, str] = {
     "~help": "~help",
     "~language": "~language [English|French|Portuguese|Spanish]",
@@ -955,6 +982,12 @@ class ModerationBot(stoat.Client):
                         if action["payload"].get("source") == "alt_detection":
                             raise ValueError("Alt-account detection has been removed")
                         moderation_actor_id = action["actor_id"]
+                        await self._require_dashboard_actor_authority(
+                            server,
+                            str(moderation_actor_id or ""),
+                            user_id,
+                            moderation_action,
+                        )
                         if moderation_action == "warn":
                             member = server.get_member(user_id) or await server.fetch_member(user_id)
                             if self._moderator_is_exempt(server.id, server, member):
@@ -1014,6 +1047,8 @@ class ModerationBot(stoat.Client):
                             details = {"reason": reason, "duration_seconds": duration_seconds}
                         elif moderation_action == "kick":
                             member = server.get_member(user_id) or await server.fetch_member(user_id)
+                            if self._moderator_is_exempt(server.id, server, member):
+                                raise PermissionError("Elevated members cannot be kicked")
                             if not await self.require_action_permissions(server, "kick_members"):
                                 raise PermissionError("Missing Kick Members permission")
                             await self._kick_member_with_reason(
@@ -1026,6 +1061,11 @@ class ModerationBot(stoat.Client):
                             event_type = "dashboard_member_kick_requested"
                             details = {"reason": reason}
                         elif moderation_action == "ban":
+                            ban_member = server.get_member(user_id)
+                            if ban_member is not None and self._moderator_is_exempt(
+                                server.id, server, ban_member
+                            ):
+                                raise PermissionError("Elevated members cannot be banned")
                             if not await self.require_action_permissions(server, "ban_members"):
                                 raise PermissionError("Missing Ban Members permission")
                             self._pending_ban_attribution[(server.id, user_id)] = (
@@ -4542,6 +4582,22 @@ class ModerationBot(stoat.Client):
             )
             return
 
+        refusal = await self._target_hierarchy_refusal(
+            server,
+            message.author_id,
+            user_id,
+            actor_member=await self._command_author_member(message, server),
+            target_member=member,
+        )
+        if refusal is not None:
+            await self.send_command_response(
+                message,
+                "Cannot mute member" if command == "~mute" else "Cannot unmute member",
+                refusal,
+                color="#ED4245",
+            )
+            return
+
         if command == "~mute" and self._member_is_moderator(server, member):
             await self.send_command_response(
                 message,
@@ -4678,6 +4734,17 @@ class ModerationBot(stoat.Client):
         if reason is None:
             return
         user_id = self._parse_user_id(parts[1])
+        refusal = await self._target_hierarchy_refusal(
+            server,
+            message.author_id,
+            user_id,
+            actor_member=await self._command_author_member(message, server),
+        )
+        if refusal is not None:
+            await self.send_command_response(
+                message, f"{command[1:].title()} refused", refusal, color="#ED4245"
+            )
+            return
         try:
             if command == "~kick":
                 if not await self.require_action_permissions(server, "kick_members"):
@@ -4751,6 +4818,7 @@ class ModerationBot(stoat.Client):
         if not await self.require_action_permissions(server, permission):
             return
         bot_id = getattr(getattr(self, "_state", None), "my_id", None)
+        actor_member = await self._command_author_member(message, server)
         done: list[str] = []
         failed: list[tuple[str, str]] = []
         for user_id in targets:
@@ -4759,6 +4827,12 @@ class ModerationBot(stoat.Client):
                 continue
             if bot_id and user_id == bot_id:
                 failed.append((user_id, f"Stoatmod can't {action} itself"))
+                continue
+            refusal = await self._target_hierarchy_refusal(
+                server, message.author_id, user_id, actor_member=actor_member
+            )
+            if refusal is not None:
+                failed.append((user_id, refusal[0].lower() + refusal[1:].rstrip(".")))
                 continue
             try:
                 if command == "~kick":
@@ -5424,6 +5498,163 @@ class ModerationBot(stoat.Client):
                 )
                 return False
         return self._member_is_moderator(server, member)
+
+    @staticmethod
+    def _is_server_owner(server: stoat.Server, user_id: object) -> bool:
+        owner_id = str(getattr(server, "owner_id", "") or "")
+        return bool(owner_id) and str(user_id or "") == owner_id
+
+    @staticmethod
+    def _rank_value(rank: object) -> float:
+        """Lower Stoat rank numbers sit higher; no rank means the bottom."""
+        try:
+            return float(rank) if rank is not None else float("inf")
+        except (TypeError, ValueError):
+            return float("inf")
+
+    @classmethod
+    def _member_rank(cls, member: object) -> float:
+        return cls._rank_value(getattr(getattr(member, "top_role", None), "rank", None))
+
+    async def _fetch_member_or_none(
+        self, server: stoat.Server, user_id: str
+    ) -> stoat.Member | None:
+        """Return the member, None when Stoat says they are not in the server.
+
+        Other lookup failures raise so callers fail closed.
+        """
+        get_member = getattr(server, "get_member", None)
+        member = get_member(user_id) if callable(get_member) else None
+        if member is None and callable(getattr(server, "fetch_member", None)):
+            try:
+                member = await server.fetch_member(user_id)
+            except stoat.errors.NotFound:
+                return None
+        return member
+
+    async def _command_author_member(
+        self, message: stoat.Message, server: stoat.Server
+    ) -> stoat.Member | None:
+        get_author_member = getattr(message, "get_author_as_member", None)
+        member = get_author_member() if callable(get_author_member) else None
+        if member is not None:
+            return member
+        try:
+            return await self._fetch_member_or_none(server, message.author_id)
+        except Exception:
+            logger.warning(
+                "command_author_member_lookup_failed server_id=%s user_id=%s",
+                getattr(server, "id", None),
+                message.author_id,
+            )
+            return None
+
+    @staticmethod
+    def _command_required_permission(command: str, parts: list[str]) -> str | None:
+        if command in COMMAND_REQUIRED_PERMISSIONS:
+            return COMMAND_REQUIRED_PERMISSIONS[command]
+        if command in SERVER_SETTINGS_COMMANDS:
+            if len(parts) == 1 or parts[1].lower() in SETTINGS_READ_ONLY_OPERATIONS:
+                return None
+            return "manage_server"
+        return None
+
+    async def _command_permission_refusal(
+        self,
+        message: stoat.Message,
+        server: stoat.Server,
+        command: str,
+        parts: list[str],
+    ) -> str | None:
+        permission = self._command_required_permission(command, parts)
+        if permission is None or self._is_server_owner(server, message.author_id):
+            return None
+        member = await self._command_author_member(message, server)
+        unverified = "I could not verify your server permissions. Please try again shortly."
+        if member is None:
+            return unverified
+        try:
+            granted = bool(getattr(server.permissions_for(member), permission, False))
+        except Exception:
+            logger.warning(
+                "command_permission_check_failed server_id=%s user_id=%s command=%s",
+                getattr(server, "id", None),
+                message.author_id,
+                command,
+            )
+            return unverified
+        if granted:
+            return None
+        return (
+            f"You need the **{PERMISSION_LABELS.get(permission, permission)}** "
+            f"permission to use `{command}` that way."
+        )
+
+    async def _target_hierarchy_refusal(
+        self,
+        server: stoat.Server,
+        actor_id: str,
+        target_id: str,
+        *,
+        actor_member: object | None = None,
+        target_member: object | None = None,
+    ) -> str | None:
+        """Refuse unless the actor's highest role is above the target's, as Stoat does."""
+        if self._is_server_owner(server, target_id):
+            return "The server owner can't be moderated."
+        if self._is_server_owner(server, actor_id):
+            return None
+        try:
+            if actor_member is None:
+                actor_member = await self._fetch_member_or_none(server, actor_id)
+            if target_member is None:
+                target_member = await self._fetch_member_or_none(server, target_id)
+        except Exception:
+            logger.warning(
+                "hierarchy_member_lookup_failed server_id=%s actor_id=%s target_id=%s",
+                getattr(server, "id", None),
+                actor_id,
+                target_id,
+            )
+            return "I could not verify the role hierarchy. Please try again shortly."
+        if actor_member is None:
+            return "I could not verify your role in this server."
+        if target_member is None:
+            return None
+        if self._member_rank(actor_member) < self._member_rank(target_member):
+            return None
+        return "Your highest role must be above that member's highest role."
+
+    async def _require_dashboard_actor_authority(
+        self,
+        server: stoat.Server,
+        actor_id: str,
+        target_id: str,
+        action: str,
+    ) -> None:
+        """Dashboard users act through Stoatmod, so hold them to Stoat's own rules."""
+        if not actor_id:
+            raise PermissionError("The dashboard user could not be identified")
+        actor_member = None
+        if not self._is_server_owner(server, actor_id):
+            try:
+                actor_member = await self._fetch_member_or_none(server, actor_id)
+            except Exception as exc:
+                raise PermissionError("Your server permissions could not be verified") from exc
+            if actor_member is None:
+                raise PermissionError("You must be a member of this server to moderate members")
+            permission = DASHBOARD_ACTION_PERMISSIONS.get(action)
+            if permission and not getattr(
+                server.permissions_for(actor_member), permission, False
+            ):
+                raise PermissionError(
+                    f"You need the {PERMISSION_LABELS[permission]} permission for this action"
+                )
+        refusal = await self._target_hierarchy_refusal(
+            server, actor_id, target_id, actor_member=actor_member
+        )
+        if refusal is not None:
+            raise PermissionError(refusal.rstrip("."))
 
     def _moderator_exemption_enabled(self, server_id: str) -> bool:
         getter = getattr(self.database, "get_moderator_exemption", None)
@@ -7968,6 +8199,15 @@ class ModerationBot(stoat.Client):
                 color="#ED4245",
             )
             return True
+        if command != "~dashboard":
+            refusal = await self._command_permission_refusal(
+                message, server, command, parts
+            )
+            if refusal is not None:
+                await self.send_command_response(
+                    message, "Permission denied", refusal, color="#ED4245"
+                )
+                return True
 
         if command == "~setup":
             if len(parts) != 1:
@@ -8427,6 +8667,18 @@ class ModerationBot(stoat.Client):
                         color="#ED4245",
                     )
                     return True
+                if not self._is_server_owner(server, message.author_id):
+                    author_member = await self._command_author_member(message, server)
+                    if author_member is None or self._member_rank(
+                        author_member
+                    ) >= self._rank_value(getattr(role, "rank", None)):
+                        await self.send_command_response(
+                            message,
+                            "Automatic role hierarchy blocked",
+                            "Your highest role must be above that role to make it automatic.",
+                            color="#ED4245",
+                        )
+                        return True
                 changed = self.database.add_auto_role(
                     server_id, role_id, message.author_id
                 )

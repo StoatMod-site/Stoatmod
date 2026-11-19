@@ -350,9 +350,11 @@ _ADMIN_PRIVACY_SECRET_FIELDS = {
 
 
 async def verify_code(request: web.Request) -> web.Response:
-    ip = request.remote or "unknown"
+    # Behind the reverse proxy request.remote is always loopback, which made
+    # this limit shared by every visitor; key it by the real client address.
+    ip = _client_ip(request)
     now = time.monotonic()
-    attempts: deque[float] = request.app[LOGIN_ATTEMPTS_KEY][ip]
+    attempts: deque[float] = request.app[LOGIN_ATTEMPTS_KEY][f"dashboard:{ip}"]
     while attempts and now - attempts[0] > 300:
         attempts.popleft()
     if len(attempts) >= 10:
@@ -1006,6 +1008,38 @@ def _case_attachment_id(request: web.Request) -> int:
     if attachment_id < 1:
         raise web.HTTPBadRequest(reason="Enter a valid evidence image ID.")
     return attachment_id
+
+
+_DOWNLOAD_CONTENT_TYPES = frozenset({
+    "image/gif", "image/jpeg", "image/png", "image/webp",
+    "application/pdf", "text/plain",
+})
+
+
+def _download_attachment_response(attachment: dict[str, Any]) -> web.Response:
+    """Serve an uploaded file as a download.
+
+    The uploader chooses the stored type and name, so only known-safe types are
+    kept and the name is percent-encoded instead of quoted into the header.
+    """
+    content_type = (
+        str(attachment.get("content_type") or "").split(";", 1)[0].strip().lower()
+    )
+    if content_type not in _DOWNLOAD_CONTENT_TYPES:
+        content_type = "application/octet-stream"
+    encoded_filename = quote(str(attachment.get("filename") or "attachment"), safe="")
+    return web.Response(
+        body=attachment["data"],
+        content_type=content_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": (
+                'attachment; filename="attachment"; '
+                f"filename*=UTF-8''{encoded_filename}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _case_attachment_response(attachment: dict[str, Any] | None) -> web.Response:
@@ -1814,11 +1848,7 @@ async def local_report_attachment(request: web.Request) -> web.Response:
     )
     if attachment is None:
         return web.Response(status=404)
-    return web.Response(
-        body=attachment["data"],
-        content_type=attachment["content_type"],
-        headers={"Content-Disposition": f'attachment; filename="{attachment["filename"]}"'},
-    )
+    return _download_attachment_response(attachment)
 
 
 def _validate_automation_payload(payload: dict[str, Any]) -> tuple[str, str, str | None, str, dict[str, Any], list[dict[str, Any]], str, list[dict[str, Any]], int]:
@@ -3489,11 +3519,7 @@ async def report_status_attachment(request: web.Request) -> web.Response:
     )
     if attachment is None:
         return web.Response(status=404)
-    return web.Response(
-        body=attachment["data"],
-        content_type=attachment["content_type"],
-        headers={"Content-Disposition": f'attachment; filename="{attachment["filename"]}"'},
-    )
+    return _download_attachment_response(attachment)
 
 
 STATUS_HISTORY_PATH_KEY = web.AppKey("status_history_path", str)

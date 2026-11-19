@@ -27,8 +27,9 @@ def fixture(failing: set[str] = frozenset()):
     async def ban(user_id, *, reason):
         if user_id in failing:
             raise RuntimeError("hierarchy")
-    server = SimpleNamespace(get_member=Mock(side_effect=lambda user_id: SimpleNamespace(id=user_id)), fetch_member=AsyncMock(), ban=AsyncMock(side_effect=ban))
-    message = SimpleNamespace(author_id="moderator", channel_id="commands")
+    server = SimpleNamespace(get_member=Mock(side_effect=lambda user_id: SimpleNamespace(id=user_id, top_role=SimpleNamespace(rank=10))), fetch_member=AsyncMock(), ban=AsyncMock(side_effect=ban))
+    moderator = SimpleNamespace(id="moderator", top_role=SimpleNamespace(rank=1))
+    message = SimpleNamespace(author_id="moderator", channel_id="commands", get_author_as_member=Mock(return_value=moderator))
     return bot, server, message
 
 

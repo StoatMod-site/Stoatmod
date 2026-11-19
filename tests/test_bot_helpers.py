@@ -2015,6 +2015,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             name="target",
             discriminator="0001",
             timeout=AsyncMock(),
+            top_role=SimpleNamespace(rank=10),
         )
         server = SimpleNamespace(
             name="Test server",
@@ -2029,6 +2030,9 @@ class ModerationBotHelperTests(unittest.TestCase):
                 return_value=SimpleNamespace(
                     name="moderator", discriminator="0002"
                 )
+            ),
+            get_author_as_member=Mock(
+                return_value=SimpleNamespace(top_role=SimpleNamespace(rank=1))
             ),
         )
         bot.database = SimpleNamespace(add_event=Mock(return_value=42))
@@ -5576,6 +5580,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             disable_moderation_category=Mock(),
             is_moderation_category_disabled=Mock(return_value=True),
@@ -5605,6 +5610,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             get_moderation_threshold=Mock(return_value=0.7),
             set_moderation_threshold=Mock(),
@@ -5639,6 +5645,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             get_moderation_threshold=Mock(return_value=0.9),
             set_moderation_threshold=Mock(),
@@ -5670,6 +5677,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             get_link_protection=Mock(return_value=True),
             set_link_protection=Mock(),
@@ -5700,6 +5708,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             get_spam_detection=Mock(return_value=True),
             set_spam_detection=Mock(),
@@ -5737,6 +5746,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             set_channel_image_scanning=Mock(),
             add_event=Mock(),
@@ -5764,6 +5774,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_author_as_user=Mock(return_value=None),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
         bot.database = SimpleNamespace(
             get_moderator_exemption=Mock(return_value=True),
             set_moderator_exemption=Mock(),
@@ -6221,6 +6232,7 @@ class ModerationBotHelperTests(unittest.TestCase):
             get_server=Mock(return_value=(server, "server")),
         )
         bot._is_moderator = Mock(return_value=True)
+        bot._command_permission_refusal = AsyncMock(return_value=None)
 
         handled = asyncio.run(bot.handle_command(message))
 
