@@ -48,6 +48,8 @@ from case_images import CASE_IMAGE_AUTHOR, case_copy, note_text, treatment as ca
 from admin_credentials import ADMIN_PASSWORD_LIFETIME_DAYS, generate_temporary_password, hash_password
 from application_flow import ApplicationFlow
 from reaction_role_flow import ReactionRoleFlow
+from channel_cache import ensure_message_channel_cached
+from gateway_access import AccessWatcher
 from join_limits import JoinLimitFlow, format_duration as format_join_limit_duration
 
 
@@ -10839,16 +10841,20 @@ def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_path)
     client = ModerationBot(settings)
+    # Reopens the gateway when the bot can see a channel its connection is not streaming (see gateway_access).
+    access_watcher = AccessWatcher(client)
 
     @client.on(stoat.ReadyEvent)
     async def on_ready(event: stoat.ReadyEvent, /) -> None:
         # Events may have been missed while disconnected: refetch members before
         # reaction roles trust the gateway cache again.
         client.reaction_role_flow.connection_reset()
+        access_watcher.start_sweeps()
         await client.handle_ready(event)
 
     @client.on(stoat.ServerCreateEvent)
     async def on_server_create(event: stoat.ServerCreateEvent, /) -> None:
+        access_watcher.watch(event.server.id, "joined")
         await client.handle_server_create(event)
 
     @client.on(stoat.ServerUpdateEvent)
@@ -10873,6 +10879,8 @@ def main() -> None:
 
     @client.on(stoat.ChannelDeleteEvent)
     async def on_channel_delete(event: stoat.ChannelDeleteEvent, /) -> None:
+        # Stoat also sends this when the bot merely loses View Channel; access often comes back moments later.
+        access_watcher.watch(str(getattr(event.channel, "server_id", "") or ""), "lost_channel")
         await client.handle_channel_delete(event)
 
     @client.on(stoat.ChannelCreateEvent)
@@ -10887,6 +10895,9 @@ def main() -> None:
         message = event.message
         if message.author_id == client.state.my_id or message.webhook is not None:
             return
+        # A channel opened to the bot after it joined is not in the cache until it is fetched once;
+        # without it the message has no server and commands there are ignored.
+        await ensure_message_channel_cached(client, message)
         author = message.get_author_as_user()
         if author is None:
             try:
@@ -11017,6 +11028,8 @@ def main() -> None:
 
     @client.on(stoat.ServerMemberUpdateEvent)
     async def on_member_update(event: stoat.ServerMemberUpdateEvent, /) -> None:
+        if event.member.id == client.state.my_id:
+            access_watcher.watch(event.member.server_id, "bot_roles")
         await client.handle_member_nickname_update(event)
 
     @client.on(stoat.UserUpdateEvent)
