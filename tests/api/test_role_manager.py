@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from aiohttp import CookieJar
+from aiohttp import CookieJar, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from api import role_manager as rm
@@ -67,16 +67,24 @@ class FakeStoat:
         self.posts = []
         self.fail_post = None
         self.post_delay = 0
+        self.server_reads = 0
+        self.member_reads = 0
+        self.fail_refresh = None  # raised by the first server read after a change
 
     async def get_self_id(self):
         return BOT
 
     async def get_server(self, server_id):
+        self.server_reads += 1
+        if self.fail_refresh and self.calls:
+            failure, self.fail_refresh = self.fail_refresh, None
+            raise failure
         if server_id not in self.servers:
             raise rm.StoatError(404, "NotFound")
         return copy.deepcopy(self.servers[server_id])
 
     async def get_member(self, server_id, user_id):
+        self.member_reads += 1
         member = self.members.get((server_id, user_id))
         return copy.deepcopy(member) if member else None
 
@@ -598,10 +606,59 @@ class RoleApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get("/api/roles")).status, 200)
         limited = await self.client.get("/api/roles")
         self.assertEqual(limited.status, 429)
+        body = await limited.json()
+        self.assertTrue(body["rate_limited"])
+        self.assertEqual(body["source"], "stoatmod")
+        self.assertTrue(1 <= body["retry_after"] <= rm.READ_LIMIT[1])
+        self.assertIn("faster than Stoatmod allows", body["error"])
         self.make_owner()
         for _ in range(rm.WRITE_LIMIT[0]):
             await self.client.put(f"/api/roles/{MEMBERS}", headers=self.csrf, json={})
         self.assertEqual((await self.client.put(f"/api/roles/{MEMBERS}", headers=self.csrf, json={})).status, 429)
+
+    async def test_a_stoat_rate_limit_says_how_long_until_the_dashboard_retries(self):
+        self.make_owner()
+        self.stoat.fail = rm.StoatError(429, "", retry_after=7.2)
+        response = await self.client.put(f"/api/roles/{MEMBERS}", headers=self.csrf, json={"name": "Retry"})
+        self.assertEqual(response.status, 429)
+        self.assertEqual(response.headers["Retry-After"], "8")
+        body = await response.json()
+        self.assertEqual((body["rate_limited"], body["source"], body["retry_after"]), (True, "stoat", 7.2))
+        self.assertEqual(body["error"], "Stoat is ratelimiting us! We'll retry your request in 8 seconds and reflect the change here.")
+        self.assertEqual(self.stoat.servers["server"]["roles"][MEMBERS]["name"], "Members")
+
+    async def test_a_rate_limit_with_no_wait_given_falls_back_to_a_short_one(self):
+        self.make_owner()
+        self.stoat.fail = rm.StoatError(429, "")
+        body = await (await self.client.put(f"/api/roles/{MEMBERS}", headers=self.csrf, json={"name": "Retry"})).json()
+        self.assertEqual(body["retry_after"], rm.DEFAULT_RETRY_SECONDS)
+
+    async def test_a_saved_change_is_never_reported_as_an_error_when_the_refresh_is_limited(self):
+        self.make_owner()
+        self.stoat.fail_refresh = rm.StoatError(429, "", retry_after=4)
+        response = await self.client.put(f"/api/roles/{MEMBERS}", headers=self.csrf, json={"name": "Regulars"})
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual((body["saved"], body["needs_refresh"], body["rate_limited"], body["retry_after"]), (True, True, True, 4.0))
+        self.assertEqual(body["changed_role_id"], MEMBERS)
+        self.assertEqual(self.stoat.servers["server"]["roles"][MEMBERS]["name"], "Regulars")
+
+    async def test_a_created_role_whose_refresh_is_limited_still_answers_created(self):
+        self.make_owner()
+        self.stoat.fail_refresh = rm.StoatError(429, "", retry_after=3)
+        response = await self.client.post("/api/roles", headers=self.csrf, json={"name": "Fresh"})
+        self.assertEqual(response.status, 201)
+        body = await response.json()
+        self.assertTrue(body["needs_refresh"])
+        self.assertTrue(body["changed_role_id"])
+
+    async def test_the_refresh_after_a_change_reuses_the_members_it_just_read(self):
+        self.make_owner()
+        response = await self.client.put(f"/api/roles/{MEMBERS}", headers=self.csrf, json={"name": "Regulars", "allow": ["react", "view_channel"], "deny": []})
+        self.assertEqual(response.status, 200)
+        # One full load before the change (server + 2 members), then only the server again afterwards.
+        self.assertEqual((self.stoat.server_reads, self.stoat.member_reads), (2, 2))
+        self.assertEqual(next(role for role in (await response.json())["roles"] if role["id"] == MEMBERS)["name"], "Regulars")
 
     async def test_the_feature_reports_when_stoat_is_unreachable_or_unconfigured(self):
         self.client.app[rm.CLIENT_KEY] = rm.StoatRoleClient("http://127.0.0.1:9", lambda: "")
@@ -788,6 +845,59 @@ class LogFormattingTests(unittest.TestCase):
                      "**Now denied:** Connect", "**No longer denied:** Listen"):
             self.assertIn(line, description)
         self.assertEqual(colour, "#5865F2")
+
+
+class StoatBudgetTests(unittest.IsolatedAsyncioTestCase):
+    """The REST client against a stand-in Stoat that answers with real rate-limit headers."""
+
+    async def asyncSetUp(self):
+        self.answers = []  # (status, body, headers) per request, in order
+        self.seen = []
+        app = web.Application()
+
+        async def handle(request):
+            self.seen.append((request.method, request.path))
+            status, body, headers = self.answers.pop(0) if self.answers else (200, {"_id": "x"}, {})
+            return web.json_response(body, status=status, headers=headers)
+
+        app.router.add_route("*", "/{tail:.*}", handle)
+        self.server = TestServer(app)
+        await self.server.start_server()
+        self.client = rm.StoatRoleClient(str(self.server.make_url("")), lambda: "token")
+
+    async def asyncTearDown(self):
+        await self.server.close()
+
+    @staticmethod
+    def budget(remaining, reset_ms):
+        return {"x-ratelimit-remaining": str(remaining), "x-ratelimit-reset-after": str(reset_ms), "x-ratelimit-limit": "5"}
+
+    async def test_a_429_carries_stoats_retry_after(self):
+        self.answers.append((429, {"retry_after": 3500}, self.budget(0, 3500)))
+        with self.assertRaises(rm.StoatError) as caught:
+            await self.client.get_server("S")
+        self.assertEqual((caught.exception.status, caught.exception.retry_after), (429, 3.5))
+
+    async def test_an_empty_budget_is_not_spent_again_before_it_refills(self):
+        self.answers.append((200, {"_id": "S"}, self.budget(0, 6000)))
+        await self.client.get_server("S")
+        with self.assertRaises(rm.StoatError) as caught:
+            await self.client.get_member("S", "user")
+        self.assertEqual(caught.exception.status, 429)
+        self.assertAlmostEqual(caught.exception.retry_after, 6, delta=0.5)
+        self.assertEqual(len(self.seen), 1)  # the second request was never sent to Stoat
+
+    async def test_a_short_wait_is_absorbed_instead_of_reported(self):
+        self.answers.append((200, {"_id": "S"}, self.budget(0, 300)))
+        await self.client.get_server("S")
+        await self.client.get_member("S", "user")
+        self.assertEqual(len(self.seen), 2)
+
+    async def test_budgets_are_kept_per_server(self):
+        self.answers.append((200, {"_id": "S"}, self.budget(0, 9000)))
+        await self.client.get_server("S")
+        await self.client.get_server("OTHER")
+        self.assertEqual(len(self.seen), 2)
 
 
 if __name__ == "__main__":

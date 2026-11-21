@@ -27,11 +27,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
 import unicodedata
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -46,6 +47,12 @@ MAX_STOPS = 20  # a sanity cap; the 128 character limit is what really bounds a 
 MAX_ROLES = 200  # Stoat's default; Stoat's own TooManyRoles answer is authoritative.
 READ_LIMIT = (40, 60)  # requests, seconds, per server and user
 WRITE_LIMIT = (20, 60)
+# Stoat allows about 5 requests per 10 seconds per server for the bot, shared with the bot's own work.
+# A wait up to this long is absorbed quietly before a request is sent; a longer one is reported to the
+# dashboard, which shows a countdown, locks the page and retries by itself.
+HOLD_MAX_SECONDS = 2.5
+DEFAULT_RETRY_SECONDS = 5.0
+MAX_RETRY_SECONDS = 60.0
 NO_ROLE_RANK = float("inf")  # a member without a role sits below every role
 OWNER_RANK = float("-inf")  # the owner outranks every role
 
@@ -287,6 +294,10 @@ class State:
     bot_id: str
     bot: Person
     actor: Person
+    # The member records this state was built from, so a refresh right after a change can reuse them
+    # instead of spending two more of Stoat's few requests.
+    bot_member: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+    actor_member: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def limit_rank(self) -> float:
@@ -367,7 +378,8 @@ def build_state(server_id: str, user_id: str, bot_id: str, server: dict[str, Any
         bits=everything if actor_is_owner else server_bits(roles, default_bits, actor_member),
         is_owner=actor_is_owner, in_server=actor_member is not None,
     )
-    return State(server_id, str(server.get("name") or ""), roles, default_bits, bot_id, bot, actor)
+    return State(server_id, str(server.get("name") or ""), roles, default_bits, bot_id, bot, actor,
+                 bot_member=bot_member, actor_member=actor_member)
 
 
 def create_refusal(state: State) -> str | None:
@@ -414,10 +426,34 @@ def snapshot(state: State) -> dict[str, Any]:
 # --------------------------------------------------------------------------- change planning
 
 class RoleError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, *, retry_after: float | None = None, source: str = ""):
         super().__init__(message)
         self.message = message
         self.status = status
+        # Set only for a rate limit: seconds until the same request can be sent again, and who is limiting
+        # ("stoat" or "stoatmod"), so the dashboard can count down, wait, and retry by itself.
+        self.retry_after = retry_after
+        self.source = source
+
+
+def wait_seconds(value: float | None) -> float:
+    """A usable wait: what Stoat said, kept within sensible bounds."""
+    if value is None or value != value:
+        return DEFAULT_RETRY_SECONDS
+    return min(MAX_RETRY_SECONDS, max(1.0, float(value)))
+
+
+def rate_limit_message(source: str, seconds: float) -> str:
+    whole = max(1, math.ceil(seconds))
+    unit = "second" if whole == 1 else "seconds"
+    if source == "stoatmod":
+        return f"You're making changes faster than Stoatmod allows. We'll retry your request in {whole} {unit} and reflect the change here."
+    return f"Stoat is ratelimiting us! We'll retry your request in {whole} {unit} and reflect the change here."
+
+
+def rate_limited(source: str, seconds: float | None) -> RoleError:
+    wait = wait_seconds(seconds)
+    return RoleError(rate_limit_message(source, wait), 429, retry_after=wait, source=source)
 
 
 _REFUSAL_ROWS = [
@@ -536,11 +572,12 @@ def plan_order(state: State, payload: Any) -> list[str]:
 # --------------------------------------------------------------------------- Stoat client
 
 class StoatError(Exception):
-    def __init__(self, status: int, kind: str = "", message: str = ""):
+    def __init__(self, status: int, kind: str = "", message: str = "", *, retry_after: float | None = None):
         super().__init__(f"Stoat error {status} {kind}")
         self.status = status
         self.kind = kind
         self.message = message
+        self.retry_after = retry_after  # seconds, only on a 429
 
 
 _STOAT_ERROR_ROWS = [
@@ -563,7 +600,7 @@ def describe_stoat_error(error: StoatError) -> RoleError:
     if error.status == 404:
         return RoleError(STOAT_ERRORS["NotFound"][1], 404)
     if error.status == 429:
-        return RoleError("Stoat is limiting requests right now. Wait a few seconds and try again.", 429)
+        return rate_limited("stoat", error.retry_after)
     return RoleError("Stoat could not complete the change. Try again in a moment.", 502)
 
 
@@ -574,28 +611,74 @@ class StoatRoleClient:
         self.api_base = api_base.rstrip("/")
         self.token = token
         self._bot_id: str | None = None
+        # What Stoat last told us about each rate-limit bucket: requests left and when it refills.
+        self._windows: dict[str, tuple[int, float]] = {}
+        self._gates: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _bucket(path: str) -> str:
+        """Stoat limits per resource: every call about one server shares a budget."""
+        parts = path.split("?", 1)[0].strip("/").split("/")
+        return "/".join(parts[:2]) if parts[0] in ("servers", "channels") and len(parts) > 1 else parts[0]
+
+    def _remember(self, bucket: str, headers: Any) -> None:
+        try:
+            remaining = int(headers.get("x-ratelimit-remaining"))
+            refills = int(headers.get("x-ratelimit-reset-after")) / 1000
+        except (TypeError, ValueError):
+            return
+        if len(self._windows) > 500:
+            now = time.monotonic()
+            self._windows = {key: value for key, value in self._windows.items() if value[1] > now}
+        self._windows[bucket] = (remaining, time.monotonic() + refills)
+
+    async def _wait_for_budget(self, bucket: str) -> None:
+        remaining, refills_at = self._windows.get(bucket, (1, 0.0))
+        wait = refills_at - time.monotonic()
+        if remaining > 0 or wait <= 0:
+            return
+        if wait > HOLD_MAX_SECONDS:
+            raise StoatError(429, "RateLimited", retry_after=wait)
+        await asyncio.sleep(wait)
 
     async def request(self, method: str, path: str, *, json_body: Any = None, allow_missing: bool = False) -> Any:
         token = self.token()
         if not token:
             raise RoleError("Role management is not available right now.", 503)
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=10, connect=3)) as session:
-                async with session.request(method, f"{self.api_base}{path}", json=json_body,
-                                           headers={"X-Bot-Token": token}) as response:
-                    if response.status == 404 and allow_missing:
-                        return None
-                    text = await response.text()
-                    try:
-                        body = json.loads(text) if text.strip() else None
-                    except ValueError:
-                        body = None
-                    if response.status >= 400:
-                        kind = str(body.get("type") or "") if isinstance(body, dict) else ""
-                        raise StoatError(response.status, kind)
-                    return body
-        except (asyncio.TimeoutError, ClientError, OSError):
-            raise StoatError(502, "Unreachable") from None
+        bucket = self._bucket(path)
+        # One request at a time per bucket, so the budget Stoat reports is spent in order, not all at once.
+        async with self._gates.setdefault(bucket, asyncio.Lock()):
+            await self._wait_for_budget(bucket)
+            try:
+                async with ClientSession(timeout=ClientTimeout(total=10, connect=3)) as session:
+                    async with session.request(method, f"{self.api_base}{path}", json=json_body,
+                                               headers={"X-Bot-Token": token}) as response:
+                        text = await response.text()
+                        try:
+                            body = json.loads(text) if text.strip() else None
+                        except ValueError:
+                            body = None
+                        retry_after = None
+                        if response.status == 429:
+                            milliseconds = body.get("retry_after") if isinstance(body, dict) else None
+                            if isinstance(milliseconds, (int, float)) and not isinstance(milliseconds, bool):
+                                retry_after = wait_seconds(milliseconds / 1000)
+                            else:
+                                try:
+                                    retry_after = wait_seconds(int(response.headers.get("x-ratelimit-reset-after")) / 1000)
+                                except (TypeError, ValueError):
+                                    retry_after = wait_seconds(None)
+                            self._windows[bucket] = (0, time.monotonic() + retry_after)
+                        else:
+                            self._remember(bucket, response.headers)
+                        if response.status == 404 and allow_missing:
+                            return None
+                        if response.status >= 400:
+                            kind = str(body.get("type") or "") if isinstance(body, dict) else ""
+                            raise StoatError(response.status, kind, retry_after=retry_after)
+                        return body
+            except (asyncio.TimeoutError, ClientError, OSError):
+                raise StoatError(502, "Unreachable") from None
 
     async def get_self_id(self) -> str:
         if self._bot_id is None:
@@ -656,21 +739,41 @@ def _limit(request: web.Request, kind: str, server_id: str, user_id: str, allowe
     while attempts and now - attempts[0] > window:
         attempts.popleft()
     if len(attempts) >= count:
-        raise RoleError("Too many role requests. Wait a minute and try again.", 429)
+        raise rate_limited("stoatmod", window - (now - attempts[0]))
     attempts.append(now)
 
 
-async def _load(request: web.Request, server_id: str, user_id: str) -> State:
+async def _load(request: web.Request, server_id: str, user_id: str, *, members_from: State | None = None) -> State:
+    """Fetch the server and both members. `members_from` reuses the members of a state loaded moments ago
+    (a role change never changes who holds which role), so a refresh after a change costs one request, not three."""
     client = request.app[CLIENT_KEY]
     try:
         bot_id = await client.get_self_id()
-        server, bot_member, actor_member = await asyncio.gather(
-            client.get_server(server_id), client.get_member(server_id, bot_id), client.get_member(server_id, user_id))
+        if members_from is not None:
+            server = await client.get_server(server_id)
+            bot_member, actor_member = members_from.bot_member, members_from.actor_member
+        else:
+            results = await asyncio.gather(
+                client.get_server(server_id), client.get_member(server_id, bot_id), client.get_member(server_id, user_id),
+                return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            server, bot_member, actor_member = results
     except StoatError as error:
         if error.status == 404:
             raise RoleError("Stoatmod is not in this server any more.", 404) from None
         raise describe_stoat_error(error) from None
     return build_state(server_id, user_id, bot_id, server, bot_member, actor_member)
+
+
+def _error_response(hooks: Hooks, error: RoleError) -> web.Response:
+    if error.retry_after is None:
+        return hooks.json_error(error.message, error.status)
+    wait = wait_seconds(error.retry_after)
+    return web.json_response(
+        {"error": error.message, "rate_limited": True, "retry_after": round(wait, 1), "source": error.source},
+        status=429, headers={"Retry-After": str(math.ceil(wait))})
 
 
 async def _guarded(request: web.Request, work: Callable[..., Any], *, write: bool, csrf: bool) -> web.Response:
@@ -686,10 +789,9 @@ async def _guarded(request: web.Request, work: Callable[..., Any], *, write: boo
         async with lock:  # one change at a time per server, so every check sees the previous result
             return await work(server_id, user_id)
     except RoleError as error:
-        return hooks.json_error(error.message, error.status)
+        return _error_response(hooks, error)
     except StoatError as error:
-        failure = describe_stoat_error(error)
-        return hooks.json_error(failure.message, failure.status)
+        return _error_response(hooks, describe_stoat_error(error))
 
 
 async def _body(request: web.Request) -> Any:
@@ -845,10 +947,24 @@ async def _blocked(request: web.Request, server_id: str, user_id: str, attempt: 
     await _post_log(request, server_id, blocked_log(_actor_label(database, server_id, user_id), attempt, error.message, role))
 
 
-async def _fresh(request: web.Request, server_id: str, user_id: str) -> dict[str, Any]:
-    state = await _load(request, server_id, user_id)
+async def _fresh(request: web.Request, server_id: str, user_id: str, *, members_from: State | None = None) -> dict[str, Any]:
+    state = await _load(request, server_id, user_id, members_from=members_from)
     configured = bool(request.app[HOOKS_KEY].database(request).get_log_channel(server_id))
     return {**snapshot(state), "log_channel": {"configured": configured}}
+
+
+async def _after_change(request: web.Request, server_id: str, user_id: str, before: State,
+                        extra: dict[str, Any], status: int = 200) -> web.Response:
+    """Answer a change that is already live in Stoat with the new list. If Stoat will not give us the list
+    right now, still answer success and say when the dashboard should fetch it; a saved change is never an error."""
+    try:
+        return web.json_response({**await _fresh(request, server_id, user_id, members_from=before), **extra}, status=status)
+    except RoleError as error:
+        limited = error.retry_after is not None
+        logger.info("role_refresh_deferred server_id=%s rate_limited=%s", server_id, limited)
+        wait = wait_seconds(error.retry_after) if limited else 2.0
+        return web.json_response({"saved": True, "needs_refresh": True, "rate_limited": limited,
+                                  "retry_after": round(wait, 1), **extra}, status=status)
 
 
 async def list_roles(request: web.Request) -> web.Response:
@@ -897,7 +1013,7 @@ async def update_role(request: web.Request) -> web.Response:
             if applied:
                 failure.message = f"Some changes were saved, but not all. {failure.message}"
             raise failure
-        return web.json_response({**await _fresh(request, server_id, user_id), "changed_role_id": role_id, "log_status": log_status})
+        return await _after_change(request, server_id, user_id, state, {"changed_role_id": role_id, "log_status": log_status})
     return await _guarded(request, work, write=True, csrf=True)
 
 
@@ -916,7 +1032,7 @@ async def reorder_roles(request: web.Request) -> web.Response:
                 order=[{"role_id": role_id, "role_name": name} for role_id, name in zip(payload["order"], names)])
         database = request.app[HOOKS_KEY].database(request)
         log_status = await _post_log(request, server_id, order_log(_actor_label(database, server_id, user_id), names))
-        return web.json_response({**await _fresh(request, server_id, user_id), "log_status": log_status})
+        return await _after_change(request, server_id, user_id, state, {"log_status": log_status})
     return await _guarded(request, work, write=True, csrf=True)
 
 
@@ -941,7 +1057,7 @@ async def create_role(request: web.Request) -> web.Response:
         _record(request, server_id, user_id, "role_created", f"Created role {name}.", role_id=role_id, role_name=name)
         database = request.app[HOOKS_KEY].database(request)
         log_status = await _post_log(request, server_id, created_log(_actor_label(database, server_id, user_id), name, role_id))
-        return web.json_response({**await _fresh(request, server_id, user_id), "changed_role_id": role_id, "log_status": log_status}, status=201)
+        return await _after_change(request, server_id, user_id, state, {"changed_role_id": role_id, "log_status": log_status}, status=201)
     return await _guarded(request, work, write=True, csrf=True)
 
 
@@ -984,7 +1100,7 @@ async def delete_role(request: web.Request) -> web.Response:
         await request.app[CLIENT_KEY].delete_role(server_id, role_id)
         _record(request, server_id, user_id, "role_deleted", f"Deleted role {role.name}.", role_id=role_id, role_name=role.name)
         log_status = await _post_log(request, server_id, deleted_log(_actor_label(database, server_id, user_id), role))
-        return web.json_response({**await _fresh(request, server_id, user_id), "log_status": log_status})
+        return await _after_change(request, server_id, user_id, state, {"log_status": log_status})
     return await _guarded(request, work, write=True, csrf=True)
 
 
